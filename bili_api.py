@@ -1,0 +1,984 @@
+"""
+B站会员购 API 客户端
+处理项目查询、场次/票档获取、下单全流程
+
+包含:
+  - 二维码扫码登录 (无需手动复制 Cookie)
+  - 项目/票档查询
+  - 下单抢票
+  - 购票人校验
+
+售罄状态码:
+  sale_flag_number 含义:
+    2   - 预售中/可售
+    3   - 已停售
+    5   - 不可售
+    102 - 已结束
+
+实名要求 (buyer_info):
+  "2,1" - 需要身份证信息(2) + 手机号(1)
+  "1"   - 仅手机号
+  ""    - 无需买家信息
+"""
+
+import hashlib
+import json
+import os
+import random
+import re
+import uuid
+import time
+import base64
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
+
+import requests
+
+from config import load_config, save_config, get_proxy
+
+BUYERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buyers.json")
+
+SALE_FLAG_MAP = {
+    2: "预售中",
+    3: "已停售",
+    5: "不可售",
+    102: "已结束",
+}
+
+PROJECT_SALE_FLAG_MAP = SALE_FLAG_MAP
+
+PROJECT_TYPE_MAP = {
+    1: "演出",
+    2: "本地生活",
+    6: "其他演出",
+    7: "虚拟直播",
+    10: "漫展",
+    12: "演唱会",
+    27: "主题餐饮",
+}
+
+SCREEN_TICKET_TYPE_MAP = {
+    1: "单日票",
+    2: "活动票",
+    12: "演出票",
+}
+
+DELIVERY_TYPE_MAP = {
+    1: "电子票",
+    4: "纸质票",
+}
+
+
+def validate_buyer_name(name: str) -> Tuple[bool, str]:
+    if not name or not name.strip():
+        return False, "姓名不能为空"
+    stripped = name.strip()
+    if len(stripped) < 2:
+        return False, "姓名至少 2 个字符"
+    if re.search(r"[0-9@#$%^&*()]", stripped):
+        return False, "姓名包含非法字符"
+    return True, stripped
+
+
+def validate_id_card(id_card: str) -> Tuple[bool, str]:
+    if not id_card or not id_card.strip():
+        return False, "身份证号不能为空"
+    card = id_card.strip().upper()
+    if not re.match(r"^\d{17}[\dX]$", card):
+        return False, "身份证号格式错误 (应为18位)"
+    weights = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+    check_map = "10X98765432"
+    try:
+        digits = [int(c) for c in card[:17]]
+        checksum = sum(w * d for w, d in zip(weights, digits)) % 11
+        if check_map[checksum] != card[17]:
+            return False, "身份证号校验位不正确"
+    except (ValueError, IndexError):
+        return False, "身份证号格式错误"
+    return True, card
+
+
+def validate_phone(phone: str) -> Tuple[bool, str]:
+    if not phone or not phone.strip():
+        return True, ""
+    p = phone.strip()
+    if not re.match(r"^1[3-9]\d{9}$", p):
+        return False, "手机号格式错误 (11位, 1开头)"
+    return True, p
+
+
+def validate_buyer(name: str, id_card: str, phone: str = "",
+                    id_bind: int = 0, buyer_info: str = "") -> Tuple[bool, list]:
+    """
+    校验购票人信息
+    返回 (通过, [错误列表])
+    id_bind: 0=不实名, 1=可选, 2=强制
+    buyer_info: "2,1" 格式表明需要身份证+手机
+    """
+    errors = []
+
+    ok, result = validate_buyer_name(name)
+    if not ok:
+        errors.append(result)
+    else:
+        name = result
+
+    need_id = id_bind > 0 or "2" in (buyer_info or "")
+    need_phone = "1" in (buyer_info or "")
+
+    if need_id:
+        ok, result = validate_id_card(id_card)
+        if not ok:
+            errors.append(result)
+        else:
+            id_card = result
+
+    if need_phone:
+        ok, result = validate_phone(phone)
+        if not ok:
+            errors.append(result)
+        else:
+            phone = result
+
+    return len(errors) == 0, errors
+
+
+def generate_ctoken(touchend=0, scrollX=0, scrollY=0,
+                     visibilitychange=0, openWindow=0,
+                     innerWidth=362, innerHeight=795,
+                     outerWidth=0, outerHeight=0,
+                     screenX=0, screenY=0,
+                     screenWidth=362, screenHeight=795,
+                     timer=0, ticket_collection_t=None):
+    """生成 ctoken 浏览器指纹 (B站 prepare 接口要求)
+
+    编码 16 项浏览器行为指标为 base64 二进制 token。
+    参考 BHYG bilibili_util.py:generate_ctoken
+    """
+    data = bytearray(b'\x00')
+    for v in [touchend, scrollX, scrollY,
+              visibilitychange, openWindow,
+              innerWidth, innerHeight,
+              outerWidth, outerHeight,
+              screenX, screenY,
+              screenWidth, screenHeight,
+              timer,
+              ticket_collection_t or int(time.time() * 1000)]:
+        if v is not None and v > 255:
+            data.extend(b'\xff\x00')
+        else:
+            data.append((v or 0) & 0xff)
+    return base64.b64encode(data).decode()
+
+
+class BiliTicketAPI:
+    """B站会员购票务 API 客户端"""
+
+    def __init__(self, cookie: str = "", config: Optional[dict] = None):
+        cfg = config or load_config()
+        self.base_url = cfg["base_url"]
+        self.version = cfg["version"]
+        self.timeout = cfg["request_timeout"]
+        self.max_retries = cfg["max_retries"]
+        self.ua = cfg["user_agent"]
+        self.cookie = cookie or cfg.get("cookie", "")
+        self.config = cfg
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": self.ua,
+            "Referer": "https://show.bilibili.com/",
+            "Origin": "https://show.bilibili.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
+
+        self._apply_proxy()
+
+        if self.cookie:
+            self._set_cookie(self.cookie)
+
+        self.csrf = self._extract_csrf()
+        self.user_info = {}
+        self.auth_verified = cfg.get("auth", {}).get("verified", False)
+
+    def _apply_proxy(self) -> None:
+        proxies = get_proxy(self.config)
+        if proxies:
+            self.session.proxies.update(proxies)
+
+    def _set_cookie(self, cookie_str: str) -> None:
+        for item in cookie_str.split(";"):
+            item = item.strip()
+            if "=" in item:
+                k, v = item.split("=", 1)
+                self.session.cookies.set(k.strip(), v.strip())
+
+    def _extract_csrf(self) -> str:
+        for cookie in self.session.cookies:
+            if cookie.name == "bili_jct":
+                return cookie.value
+        return ""
+
+    def _request(self, method: str, path: str, **kwargs) -> dict:
+        url = f"{self.base_url}{path}"
+        kwargs.setdefault("timeout", self.timeout)
+        for attempt in range(self.max_retries):
+            try:
+                resp = self.session.request(method, url, **kwargs)
+                data = resp.json()
+                return data
+            except requests.Timeout:
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(0.5)
+            except requests.ConnectionError:
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(1)
+            except json.JSONDecodeError:
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(0.5)
+        return {}
+
+    # ── 鉴权 ─────────────────────────────────────────────────
+
+    @staticmethod
+    def qrcode_login(show_func=None) -> Tuple[bool, str]:
+        """
+        扫码登录完整流程, 返回 (是否成功, cookie_string)
+
+        流程:
+          1. 生成二维码 (可选传入 show_func(url) 来展示)
+          2. 轮询扫码状态
+          3. 提取 Cookie (从 session + 确认 URL)
+        """
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.bilibili.com",
+        })
+
+        r = session.get(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
+            timeout=10)
+        data = r.json()
+        if data.get("code") != 0:
+            return False, f"生成二维码失败: {data.get('message')}"
+
+        qr_url = data["data"]["url"]
+        qrcode_key = data["data"]["qrcode_key"]
+
+        if show_func:
+            show_func(qr_url)
+
+        start = time.time()
+        last_status = None
+
+        while time.time() - start < 180:
+            params = {"qrcode_key": qrcode_key}
+            try:
+                resp = session.get(
+                    "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+                    params=params, timeout=10)
+                inner = resp.json().get("data", {})
+            except Exception as e:
+                return False, f"轮询异常: {e}"
+
+            code = inner.get("code", -1)
+
+            if code != last_status:
+                last_status = code
+                status_map = {
+                    86101: "等待扫码...",
+                    86090: "已扫码, 请在手机上确认",
+                    86038: "二维码已过期",
+                    0: "登录成功!",
+                }
+                print(f"  [{time.strftime('%H:%M:%S')}] "
+                      f"{status_map.get(code, inner.get('message', '未知'))}")
+
+            if code == 0:
+                cookies = dict(session.cookies)
+
+                if inner.get("url"):
+                    from urllib.parse import urlparse, parse_qs
+                    qs = parse_qs(urlparse(inner["url"]).query)
+                    for k, v in qs.items():
+                        if k not in cookies:
+                            cookies[k] = v[0]
+
+                cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                cfg = load_config()
+                cfg["cookie"] = cookie_str
+                save_config(cfg)
+                return True, cookie_str
+
+            if code == 86038:
+                return False, "二维码已过期"
+
+            time.sleep(1.5)
+
+        return False, "登录超时"
+
+    def verify_auth(self) -> Tuple[bool, str, dict]:
+        """验证 Cookie 是否有效, 返回 (是否成功, 用户名, 用户信息)"""
+        if not self.cookie:
+            return False, "未设置 Cookie", {}
+
+        info = self.get_user_info()
+        if info.get("code") != 0 and info.get("errno") != 0:
+            return False, info.get("message", info.get("msg", "登录验证失败")), {}
+
+        user = info.get("data", {})
+        uname = user.get("uname", user.get("name", ""))
+        uid = user.get("mid", 0)
+
+        self.user_info = user
+        self.auth_verified = True
+
+        auth_data = {"uid": uid, "uname": uname, "verified": True}
+        saved_cfg = load_config()
+        saved_cfg["auth"] = auth_data
+        save_config(saved_cfg)
+
+        return True, uname, user
+
+    def is_authenticated(self) -> bool:
+        return self.auth_verified and bool(self.csrf)
+
+    # ── 项目查询 ─────────────────────────────────────────────
+
+    def get_project_detail(self, project_id: int) -> dict:
+        return self._request("GET",
+            f"/api/ticket/project/getV2?version={self.version}&id={project_id}")
+
+    def get_project_summary(self, project_id: int) -> Optional[dict]:
+        detail = self.get_project_detail(project_id)
+        if detail.get("code") != 0:
+            print(f"[错误] 获取项目详情失败: {detail.get('message', detail)}")
+            return None
+        return detail.get("data", {})
+
+    def get_project_skus(self, project_id: int) -> list:
+        detail = self.get_project_detail(project_id)
+        if detail.get("code") != 0:
+            print(f"[错误] 获取项目详情失败: {detail.get('message', detail)}")
+            return []
+
+        data = detail.get("data", {})
+        if not data:
+            return []
+
+        project_type = PROJECT_TYPE_MAP.get(data.get("type", 0), "未知")
+        skus = []
+        for screen in data.get("screen_list", []):
+            screen_ticket_type = SCREEN_TICKET_TYPE_MAP.get(
+                screen.get("ticket_type", 0), "未知")
+            screen_info = {
+                "screen_id": screen["id"],
+                "screen_name": screen["name"],
+                "screen_sale_flag": SALE_FLAG_MAP.get(
+                    screen.get("saleFlag", {}).get("number", 0), "未知"),
+                "screen_sale_number": screen.get("saleFlag", {}).get("number", 0),
+                "screen_clickable": screen.get("clickable", False),
+                "screen_start_time": screen.get("start_time_str", ""),
+                "screen_start_ts": screen.get("start_time", 0),
+                "delivery_type": screen.get("delivery_type", 1),
+                "delivery_name": DELIVERY_TYPE_MAP.get(
+                    screen.get("delivery_type", 1), "未知"),
+                "project_type": project_type,
+                "ticket_type": screen_ticket_type,
+            }
+            for ticket in screen.get("ticket_list", []):
+                sfn = ticket.get("sale_flag_number", 0)
+                skus.append({
+                    **screen_info,
+                    "sku_id": ticket["id"],
+                    "price": ticket["price"],
+                    "price_yuan": ticket["price"] / 100,
+                    "desc": ticket["desc"],
+                    "sale_flag": SALE_FLAG_MAP.get(sfn, "未知"),
+                    "sale_flag_number": sfn,
+                    "clickable": ticket.get("clickable", False),
+                    "num": ticket.get("num", 0),
+                    "sale_start": ticket.get("sale_start", ""),
+                    "sale_end": ticket.get("sale_end", ""),
+                    "limit_num": ticket.get("static_limit", {}).get("num", 0),
+                    "white_sku": ticket.get("whiteSku", None),
+                })
+        return skus
+
+    def check_ticket_available(self, project_id: int,
+                                sku_id: int = 0,
+                                screen_id: int = 0,
+                                min_price: int = 0,
+                                max_price: int = 99999999) -> tuple:
+        detail = self.get_project_detail(project_id)
+        if detail.get("code") != 0:
+            print(f"[错误] {detail.get('message', detail)}")
+            return {}, []
+
+        proj = detail.get("data", {})
+        project_type = PROJECT_TYPE_MAP.get(proj.get("type", 0), "未知")
+        project_status = {
+            "name": proj.get("name", ""),
+            "sale_flag": proj.get("sale_flag", ""),
+            "sale_flag_number": proj.get("sale_flag_number", 0),
+            "is_sale": proj.get("is_sale", 0),
+            "can_click": proj.get("canClick", False),
+            "default_button": proj.get("default_button", 0),
+            "id_bind": proj.get("id_bind", 0),
+            "buyer_info": proj.get("buyer_info", ""),
+            "project_type": project_type,
+            "venue": proj.get("venue_info", {}).get("name", ""),
+            "price_low": proj.get("price_low", 0),
+            "price_high": proj.get("price_high", 0),
+        }
+
+        available = []
+        for screen in proj.get("screen_list", []):
+            for ticket in screen.get("ticket_list", []):
+                sn = ticket.get("sale_flag_number", 0)
+                if sn != 2:
+                    continue
+                if sku_id and ticket["id"] != sku_id:
+                    continue
+                if screen_id and screen["id"] != screen_id:
+                    continue
+                if ticket["price"] < min_price or ticket["price"] > max_price:
+                    continue
+                available.append({
+                    "sku_id": ticket["id"],
+                    "screen_id": screen["id"],
+                    "screen_name": screen["name"],
+                    "screen_type": SCREEN_TICKET_TYPE_MAP.get(
+                        screen.get("ticket_type", 0), "未知"),
+                    "desc": ticket["desc"],
+                    "price": ticket["price"],
+                    "price_yuan": ticket["price"] / 100,
+                    "num": ticket.get("num", 0),
+                    "sale_start": ticket.get("sale_start", ""),
+                    "sale_end": ticket.get("sale_end", ""),
+                    "ticket_type": project_type,
+                })
+        return project_status, available
+
+    def get_user_info(self) -> dict:
+        return self._request("GET",
+            f"/api/ticket/user/info?version={self.version}")
+
+    def get_buyers_list(self) -> list:
+        """获取账号已绑定的实名观演人列表"""
+        data = self._request("GET",
+            f"/api/ticket/buyer/list?version={self.version}")
+        if data.get("code") != 0 and data.get("errno") != 0:
+            return []
+        result = []
+        for buyer in data.get("data", {}).get("list", []) or []:
+            bid = buyer.get("id", "")
+            name = buyer.get("name", "")
+            tel = buyer.get("tel", buyer.get("phone", ""))
+            id_card = buyer.get("id_card", buyer.get("personal_id", ""))
+            if bid and name:
+                result.append({"id": str(bid), "name": name,
+                                "tel": str(tel), "id_card": str(id_card)})
+        return result
+
+    # ── 验证码处理 ────────────────────────────────────────────
+
+    def check_captcha(self, project_id: int, screen_id: int) -> bool:
+        """检查是否需要验证码, 返回 True 表示需要"""
+        ts = int(time.time() * 1000)
+        data = self._request("GET",
+            f"/api/ticket/graph/prepare?project_id={project_id}"
+            f"&screen_id={screen_id}&timestamp={ts}")
+        return bool(data.get("data")) and data.get("code") == 0
+
+    def solve_captcha(self, project_id: int, screen_id: int) -> Optional[str]:
+        """求解验证码, 返回 voucher (失败返回 None)
+
+        注意: 完整验证码求解需要集成 GeeTest 自动滑块库。
+        目前返回 None 表示需要手动处理。
+        """
+        ts = int(time.time() * 1000)
+        data = self._request("GET",
+            f"/api/ticket/graph/prepare?project_id={project_id}"
+            f"&screen_id={screen_id}&timestamp={ts}")
+        if data.get("code") != 0:
+            return None
+
+        cap_data = data.get("data", {})
+        if not cap_data:
+            return None
+
+        print(f"[验证码] 检测到验证码: {json.dumps(cap_data, ensure_ascii=False)[:200]}")
+        print(f"[验证码] 请在浏览器中手动完成验证码后重试")
+        return None
+
+    CREATE_ORDER_URL = "https://show.bilibili.com/api/ticket/order/createV2"
+
+    def _extract_device_id(self) -> str:
+        for cookie in self.session.cookies:
+            if cookie.name == "deviceFingerprint":
+                return cookie.value
+        for cookie in self.session.cookies:
+            if cookie.name == "buvid_fp":
+                return cookie.value
+        return str(uuid.uuid4()).replace("-", "")
+
+    def _generate_click_position(self) -> str:
+        now_ms = int(time.time() * 1000)
+        origin = now_ms - 7230
+        return json.dumps({"x": 255, "y": 730, "origin": origin, "now": now_ms},
+                          separators=(",", ":"))
+
+    def create_order_v2(self, project_id: int, screen_id: int,
+                         sku_id: int, buy_num: int = 1,
+                         device_id: str = "", buyer_name: str = "",
+                         buyer_phone: str = "", buyer_id_card: str = "",
+                         pay_money: int = 0, token: str = "",
+                         ptoken: str = "", id_bind: int = 0,
+                         order_type: int = 1,
+                         ctoken: str = "",
+                         captcha_voucher: str = "") -> dict:
+        """createV2 下单 (完整版, 参考 BHYG)
+
+        token/ptoken: 从 prepare 接口获取
+        ctoken: 浏览器指纹 (用于热门项目)
+        captcha_voucher: 验证码凭证 (如果触发)
+        """
+        if not device_id:
+            device_id = self._extract_device_id()
+        if not ctoken:
+            ctoken = generate_ctoken()
+
+        payload = {
+            "project_id": project_id,
+            "screen_id": screen_id,
+            "sku_id": sku_id,
+            "count": buy_num,
+            "pay_money": pay_money,
+            "order_type": order_type,
+            "timestamp": int(time.time() * 1000),
+            "id_bind": id_bind,
+            "need_contact": 1 if id_bind == 0 else 0,
+            "is_package": 0,
+            "package_num": 1,
+            "token": token,
+            "deviceId": device_id,
+            "version": "1.1.0",
+            "coupon_code": "",
+            "again": 0,
+            "clickPosition": {
+                "x": random.randint(200, 400),
+                "y": random.randint(750, 800),
+                "origin": int(time.time() * 1000) - random.randint(5000, 8000),
+                "now": int(time.time() * 1000),
+            },
+            "ctoken": ctoken,
+            "requestSource": "neul-next",
+            "newRisk": True,
+        }
+
+        if id_bind == 0:
+            payload["contactInfo"] = {
+                "uid": self.config.get("auth", {}).get("uid", 0),
+                "username": buyer_name,
+                "tel": buyer_phone,
+            }
+            payload["buyer"] = buyer_name
+            payload["tel"] = buyer_phone
+        else:
+            payload["buyer_info"] = json.dumps([{
+                "name": buyer_name,
+                "id_card": buyer_id_card,
+                "phone": buyer_phone,
+            }]) if buyer_name else ""
+
+        if ptoken:
+            payload["ptoken"] = ptoken
+        if captcha_voucher:
+            payload["voucher"] = captcha_voucher
+
+        headers = self.session.headers.copy()
+        uid = self.config.get("auth", {}).get("uid", 0)
+        headers["x-risk-header"] = (
+            f"platform/pc uid/{uid} deviceId/{device_id}"
+        )
+        if token:
+            headers["Referer"] = (
+                f"https://show.bilibili.com/platform/confirmOrder.html"
+                f"?token={token}&project_id={project_id}"
+            )
+
+        url = f"/api/ticket/order/createV2?project_id={project_id}"
+        if ptoken:
+            url += f"&ptoken={ptoken}"
+
+        return self._request("POST", url, headers=headers, json=payload)
+
+    def prepare_order(self, project_id: int, screen_id: int,
+                       sku_id: int, buy_num: int = 1,
+                       buyer_info: str = "",
+                       order_type: int = 1,
+                       device_id: str = "") -> dict:
+        """准备订单, 获取 token + ptoken
+
+        参考 BHYG 的 prepare_token 实现。
+        返回 data 中包含 token 和 ptoken。
+        """
+        if not device_id:
+            device_id = self._extract_device_id()
+
+        ctoken = generate_ctoken(
+            touchend=random.randint(1, 5),
+            visibilitychange=random.randint(1, 3),
+            openWindow=random.randint(1, 3),
+        )
+
+        payload = {
+            "project_id": project_id,
+            "screen_id": screen_id,
+            "order_type": order_type,
+            "count": buy_num,
+            "sku_id": sku_id,
+            "buyer_info": buyer_info,
+            "token": ctoken,
+            "ignoreRequestLimit": True,
+            "ticket_agent": "",
+            "newRisk": True,
+            "requestSource": "neul-next",
+        }
+        return self._request("POST",
+            f"/api/ticket/order/prepare?project_id={project_id}",
+            json=payload)
+
+    def get_order_status(self, order_id: str) -> dict:
+        return self._request("GET",
+            f"/api/ticket/order/orderInfo?version={self.version}&order_id={order_id}")
+
+    # ── 响应分类 (用于退避策略) ────────────────────────────────
+
+    @staticmethod
+    def classify_response(data: dict) -> Tuple[bool, str]:
+        """根据接口返回判断成功/失败及原因
+
+        返回 (是否成功, 原因描述)
+
+        退避策略:
+          - "请慢一点" → 指数退避 (500ms → 1000ms → 2000ms)
+          - "尚未开售/不可售" → 继续等
+          - "库存不足" → 停止
+          - "风控/验证码" → 停止
+          - "登录异常" → 停止
+        """
+        code = data.get("code")
+        errno = data.get("errno")
+        msg = str(data.get("message") or data.get("msg") or "")
+
+        if code == 0 or errno == 0:
+            return True, "成功"
+
+        if code == 100048 or errno == 100048:
+            return True, "成功(已有未完成订单)"
+
+        if any(k in msg for k in ("联系人信息", "姓名及手机号", "手机号")):
+            return False, "NEED_CONTACT"
+
+        text = msg.lower()
+        if "请慢一点" in msg or "前方拥堵" in msg:
+            return False, "RATE_LIMIT"
+        if any(k in msg for k in ("未开始", "未开售", "不可售", "未到开售")):
+            return False, "NOT_STARTED"
+        if any(k in msg for k in ("库存", "售罄", "卖光", "已抢光")):
+            return False, "SOLD_OUT"
+        if any(k in msg for k in ("登录", "账号", "cookie", "鉴权")):
+            return False, "AUTH_ERROR"
+        if any(k in msg for k in ("风控", "验证码", "滑块")):
+            return False, "CAPTCHA"
+        if any(k in text for k in ("risk", "captcha")):
+            return False, "CAPTCHA"
+
+        return False, f"code={code} errno={errno}"
+
+    # ── 抢票引擎 (dry-run + 指数退避 + 开售等待) ─────────────
+
+    def sniper_buy(self, project_id: int, sku_id: int,
+                    screen_id: int = 0, buy_num: int = 1,
+                    buyer_name: str = "", buyer_phone: str = "",
+                    buyer_id_card: str = "",
+                    pay_money: int = 0, dry_run: bool = True,
+                    token: str = "", id_bind: int = 0,
+                    order_type: int = 1,
+                    wait_sale: bool = False, sale_time_str: str = "",
+                    poll_interval: float = None,
+                    max_retry_seconds: float = 10.0) -> Optional[dict]:
+        """抢票引擎
+
+        dry_run: True=仅打印 payload, False=prepare → createV2 真实下单
+        token: 已有 token (跳过 prepare), 为空则自动调用 prepare 获取
+        """
+        if poll_interval is None:
+            poll_interval = load_config().get("poll_interval", 0.3)
+        cfg = load_config()
+        device_id = self._extract_device_id()
+        ctoken = generate_ctoken(
+            touchend=random.randint(1, 5),
+            visibilitychange=random.randint(1, 3),
+            openWindow=random.randint(1, 3),
+        )
+
+        if dry_run:
+            payload = {
+                "project_id": project_id, "screen_id": screen_id,
+                "sku_id": sku_id, "count": buy_num,
+                "pay_money": pay_money, "order_type": order_type,
+                "id_bind": id_bind, "need_contact": 1 if id_bind == 0 else 0,
+                "buyer": buyer_name, "tel": buyer_phone,
+                "deviceId": device_id, "token": token or "(auto via prepare)",
+                "ctoken": ctoken, "clickPosition": "...",
+                "requestSource": "neul-next", "newRisk": True,
+                "version": "1.1.0",
+            }
+            print(f"\n{' DRY-RUN 模拟下单 ':━^60}")
+            print(f"  流程: prepare (获取token) → createV2 (下单)")
+            print(f"  createV2 URL: /api/ticket/order/createV2?project_id={project_id}")
+            print(f"  Payload:")
+            for k, v in payload.items():
+                print(f"    {k}: {v}")
+            print(f"  (未真实提交, 使用 --real 参数可真实下单)")
+            if not token:
+                print(f"  (token 为空时将自动调用 prepare 获取)")
+            return {"dry_run": True, "payload": payload}
+
+        if wait_sale and sale_time_str:
+            try:
+                st = datetime.fromisoformat(sale_time_str.replace(" ", "T"))
+                self._wait_until_sale(st)
+            except Exception as e:
+                print(f"[警告] 开售时间解析失败: {e}")
+
+        attempt = 0
+        _token = token
+        _ptoken = ""
+        _voucher = ""
+        deadline = time.monotonic() + max_retry_seconds
+        slow_count = 0
+        count_412 = 0
+
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                if not _token:
+                    print(f"[prepare #{attempt}] 获取 token...")
+                    prep = self.prepare_order(
+                        project_id, screen_id, sku_id, buy_num,
+                        order_type=order_type,
+                    )
+                    prep_code = prep.get("code")
+                    prep_errno = prep.get("errno")
+                    if prep_code == 0 or prep_errno == 0:
+                        prep_data = prep.get("data", {})
+                        _token = prep_data.get("token", "")
+                        _ptoken = prep_data.get("ptoken", "")
+                        print(f"[prepare OK] token={_token[:20]}..."
+                              f"{' ptoken=' + _ptoken[:10] + '...' if _ptoken else ''}")
+                    elif prep_code == 412:
+                        count_412 += 1
+                        backoff = 1 if count_412 < 20 else 300
+                        print(f"[prepare 412 #{attempt}] 访问拒绝, "
+                              f"退避 {backoff}s (第{count_412}次)")
+                        if count_412 >= 20:
+                            print(f"[prepare] 连续 20 次 412, 冷却 5 分钟")
+                        time.sleep(backoff)
+                        continue
+                    else:
+                        print(f"[prepare fail #{attempt}] "
+                              f"code={prep_code} msg={prep.get('message')}")
+                        if prep_code == 83000005:
+                            print(f"[prepare] 项目可能未开售或参数错误")
+                            return None
+                        time.sleep(poll_interval)
+                        continue
+
+                print(f"[下单 #{attempt}] createV2...")
+                order = self.create_order_v2(
+                    project_id, screen_id, sku_id, buy_num,
+                    device_id=device_id,
+                    buyer_name=buyer_name,
+                    buyer_phone=buyer_phone,
+                    buyer_id_card=buyer_id_card,
+                    pay_money=pay_money,
+                    token=_token,
+                    ptoken=_ptoken,
+                    id_bind=id_bind,
+                    order_type=order_type,
+                    ctoken=ctoken,
+                    captcha_voucher=_voucher,
+                )
+
+                ok, reason = self.classify_response(order)
+                code = order.get("code")
+                msg = order.get("message", order.get("msg", ""))
+
+                if ok:
+                    order_data = order.get("data", {})
+                    order_id = order_data.get("order_id", "")
+                    print(f"[成功 #{attempt}] order_id={order_id}")
+                    self._notify_success(order, buyer_name)
+                    return {"order_id": order_id, **order_data}
+
+                if reason == "RATE_LIMIT":
+                    slow_count += 1
+                    backoff = min(0.5 * (2 ** (slow_count - 1)), 2.0)
+                    print(f"[限流 #{attempt}] → 退避 {backoff}s")
+                    if slow_count >= 5:
+                        print("[停止] 连续 5 次限流")
+                        return None
+                    time.sleep(backoff)
+                    continue
+
+                if reason == "NOT_STARTED":
+                    print(f"[未开售 #{attempt}] {msg} → 重新获取 token")
+                    _token = ""
+                    _ptoken = ""
+                    time.sleep(poll_interval)
+                    continue
+
+                if reason == "NEED_CONTACT":
+                    print(f"[错误 #{attempt}] {msg} → 需要填写手机号")
+                    print(f"  当前 buyer_phone='{buyer_phone}'")
+                    return None
+                    print(f"[售罄 #{attempt}] {msg}")
+                    return None
+
+                if reason == "AUTH_ERROR":
+                    print(f"[鉴权 #{attempt}] {msg}")
+                    return None
+
+                if reason == "CAPTCHA":
+                    print(f"[风控 #{attempt}] code={code} {msg}")
+                    if code == 100044:
+                        _voucher = self.solve_captcha(project_id, screen_id)
+                        if _voucher:
+                            print(f"[验证码] 已解决, 重试...")
+                            continue
+                    return None
+
+                if code == 412:
+                    count_412 += 1
+                    backoff = 1 if count_412 < 20 else 300
+                    print(f"[412 #{attempt}] 访问拒绝, "
+                          f"退避 {backoff}s ({count_412}/20)")
+                    if count_412 >= 20:
+                        print("[412] 连续 20 次, 冷却 5 分钟")
+                    time.sleep(backoff)
+                    _token = ""
+                    _ptoken = ""
+                    continue
+
+                if code == 100001 or code == 100009:
+                    print(f"[重试 #{attempt}] code={code} {msg}")
+                    _token = ""
+                    _ptoken = ""
+                    time.sleep(poll_interval)
+                    continue
+
+                if code == 100034:
+                    new_price = order.get("data", {}).get("pay_money", pay_money)
+                    print(f"[价格变动 #{attempt}] 新价格: {new_price} (旧: {pay_money})")
+                    pay_money = new_price
+                    _token = ""
+                    _ptoken = ""
+                    continue
+
+                if code == 3:
+                    print(f"[屏蔽 #{attempt}] {msg} → 退避 5s")
+                    time.sleep(5)
+                    _token = ""
+                    _ptoken = ""
+                    continue
+
+                if code == -401:
+                    print(f"[GAIA #{attempt}] 触发反机器人验证, 需手动处理")
+                    return None
+
+                print(f"[错误 #{attempt}] code={code} {msg}")
+                slow_count = 0
+                count_412 = 0
+                time.sleep(poll_interval)
+
+            except requests.Timeout:
+                print(f"[超时 #{attempt}] 重试...")
+                time.sleep(poll_interval)
+            except requests.ConnectionError:
+                print(f"[网络 #{attempt}] 重试...")
+                time.sleep(1)
+            except KeyboardInterrupt:
+                print("\n[中断]")
+                return None
+
+        print(f"[停止] 超时 {max_retry_seconds}s")
+        return None
+
+    @staticmethod
+    def _wait_until_sale(target_time: datetime) -> None:
+        """自适应等待到开售时间
+
+        距离开售 >60s: 每 15s 检查
+        距离开售 >10s: 每 2s 检查
+        距离开售 >1s:  每 0.1s 检查
+        距离开售 <=1s: 每 3ms 检查 (高精度)
+        """
+        print(f"\n[等待] 目标开售时间: {target_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        last_remain = None
+        while True:
+            remain = (target_time - datetime.now()).total_seconds()
+            if remain <= 0:
+                print("[开售] 时间到, 开始下单!")
+                return
+
+            # 只在变化明显时打印
+            if last_remain is None or abs(remain - last_remain) > 0.5:
+                print(f"[等待] 距离开售 {remain:.0f}s")
+                last_remain = remain
+
+            if remain > 60:
+                time.sleep(15)
+            elif remain > 10:
+                time.sleep(2)
+            elif remain > 1:
+                time.sleep(0.1)
+            else:
+                time.sleep(0.003)
+
+    def _notify_success(self, order: dict, buyer_name: str) -> None:
+        try:
+            from notify import send_order_success
+            send_order_success(
+                order.get("data", order),
+                project_name="",
+                ticket_desc="",
+                buyer_name=buyer_name,
+                config=self.config,
+            )
+        except Exception as e:
+            print(f"[通知] 发送失败: {e}")
+
+
+def load_buyers() -> list:
+    if os.path.exists(BUYERS_FILE):
+        with open(BUYERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def save_buyers(buyers: list) -> None:
+    with open(BUYERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(buyers, f, ensure_ascii=False, indent=2)

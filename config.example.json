@@ -1,0 +1,25 @@
+{
+  "cookie": "",
+  "version": "134",
+  "base_url": "https://show.bilibili.com",
+  "request_timeout": 10,
+  "poll_interval": 0.3,
+  "max_retries": 3,
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+  "proxy": {
+    "enabled": false,
+    "http": "",
+    "https": ""
+  },
+  "notification": {
+    "enabled": false,
+    "tg_token": "",
+    "tg_chat_id": "",
+    "feishu_webhook": ""
+  },
+  "auth": {
+    "uid": 0,
+    "uname": "",
+    "verified": false
+  }
+}
