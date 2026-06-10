@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time as _time
 from time import sleep
@@ -948,8 +949,8 @@ def interactive_menu():
         print(f"  [3] 管理购票人      [4] 从B站获取实名观演人")
         print(f"  [5] 查看项目详情    [6] 查看可购票档")
         print(f"  [7] 监控票档        [8] 抢票 (dry-run / 真实)")
-        print(f"  [9] 接口诊断        [A] 代理/通知配置")
-        print(f"  [0] 退出")
+        print(f"  [9] 接口诊断        [R] API逆向工程")
+        print(f"  [A] 代理/通知配置    [0] 退出")
         print(f"{'─' * 60}")
 
         choice = _prompt("选择").strip().upper()
@@ -1166,6 +1167,13 @@ def interactive_menu():
                 cmd_diagnose(type("A", (), {
                     "project_id": pid, "screen_id": 0, "sku_id": 0
                 })())
+
+            elif choice in ("R", "r"):
+                import subprocess
+                pid = int(_prompt("项目ID", str(last_project or 1001227)) or "1001227")
+                print(f"\n  启动逆向工程 (python reverse.py {pid} --quick)...\n")
+                subprocess.run([sys.executable, "reverse.py", str(pid), "--quick"])
+                input("\n  按回车返回...")
 
             elif choice in ("A", "a"):
                 while True:
