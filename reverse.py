@@ -194,6 +194,53 @@ class APIReverser:
         except Exception as e:
             return {"errno": -999, "msg": str(e)}
 
+    def discover_fallback_projects(self, count=5):
+        """发现可选项目列表 (createV2 限流时轮换)"""
+        pids = []
+        try:
+            r = self.session.get(
+                "https://show.bilibili.com/api/ticket/project/listV2"
+                "?page=1&pagesize=20&platform=web&area=-1&p_type=0",
+                timeout=10)
+            data = r.json()
+            results = (data.get("data", {}) or {}).get("result", [])
+            for proj in results:
+                pid = proj.get("id")
+                if pid and pid != self.pid:
+                    detail = self.api.get_project_detail(pid)
+                    pd = detail.get("data", {})
+                    screens = pd.get("screen_list", [])
+                    has_avail = False
+                    for sc in screens:
+                        for tk in sc.get("ticket_list", []):
+                            if tk.get("sale_flag_number") == 2 and tk.get("clickable"):
+                                has_avail = True
+                                break
+                    if has_avail and pd.get("sale_flag_number") == 2:
+                        pids.append(pid)
+                        if len(pids) >= count:
+                            break
+        except Exception as e:
+            print(f"  (发现备用项目失败: {e})")
+        return pids
+
+    def _switch_project(self, pid):
+        """切换到新的测试项目 (创建新 token)"""
+        status, avail = self.api.check_ticket_available(pid)
+        if not avail:
+            return False
+        t = avail[0]
+        self.pid = pid
+        self.sid = t["screen_id"]
+        self.sku = t["sku_id"]
+        self.pay_money = int(t["price"])
+        self.project = status
+        self.available = avail
+        prep = self.api.prepare_order(self.pid, self.sid, self.sku, 1)
+        self.token = (prep.get("data", {}) or {}).get("token", "")
+        self.ptoken = (prep.get("data", {}) or {}).get("ptoken", "") or ""
+        return True
+
     # ── 端点扫描 ──
 
     def scan_endpoints(self):
@@ -309,125 +356,123 @@ class APIReverser:
 
         return self.diff_test("prepare", url, base, mutations)
 
-    def reverse_create_v2(self):
-        """逆向 createV2 接口"""
-        # 先获取 token
+    def reverse_create_v2(self, rotate=True):
+        """逆向 createV2 接口
+
+        单项目限流对策: 如果 rotate=True, 自动发现备用项目轮流测试
+        """
         if not self.token:
             prep = self.api.prepare_order(self.pid, self.sid, self.sku, 1)
             self.token = (prep.get("data", {}) or {}).get("token", "")
             self.ptoken = (prep.get("data", {}) or {}).get("ptoken", "") or ""
 
-            if not self.token:
-                print("  无法获取 token, 跳过 createV2 逆向")
-                return []
+        if not self.token:
+            print("  无法获取 token, 跳过 createV2 逆向")
+            return []
 
         url = f"https://show.bilibili.com/api/ticket/order/createV2?project_id={self.pid}"
         now_ms = int(time.time() * 1000)
-
         id_bind = self.project.get("id_bind", 0)
-        base = {
-            "project_id": self.pid,
-            "screen_id": self.sid,
-            "sku_id": self.sku,
-            "count": 1,
-            "pay_money": self.pay_money,
-            "timestamp": now_ms,
-            "token": self.token,
-            "deviceId": self.device_id,
-            "order_type": 1,
-            "id_bind": id_bind,
-            "need_contact": 1 if id_bind == 0 else 0,
-            "is_package": 0,
-            "package_num": 1,
-            "version": "1.1.0",
-            "coupon_code": "",
-            "again": 0,
-            "contactInfo": {
-                "uid": self.uid,
-                "username": "_rev_",
-                "tel": "13800138000",
-            },
-            "buyer": "_rev_",
-            "tel": "13800138000",
-            "clickPosition": {
-                "x": random.randint(200, 400),
-                "y": random.randint(750, 800),
-                "origin": now_ms - random.randint(2000, 8000),
-                "now": now_ms,
-            },
-            "ctoken": generate_ctoken(),
-            "requestSource": "neul-next",
-            "newRisk": True,
-        }
-        if self.ptoken:
-            base["ptoken"] = self.ptoken
 
-        # 按重要性排序 mutations (最重要的先测, 因为第一单后会限流)
+        def _make_base():
+            return {
+                "project_id": self.pid, "screen_id": self.sid,
+                "sku_id": self.sku, "count": 1,
+                "pay_money": self.pay_money, "timestamp": int(time.time()*1000),
+                "token": self.token, "deviceId": self.device_id,
+                "order_type": 1, "id_bind": id_bind,
+                "need_contact": 1 if id_bind == 0 else 0,
+                "is_package": 0, "package_num": 1,
+                "version": "1.1.0", "coupon_code": "", "again": 0,
+                "contactInfo": {"uid": self.uid, "username": "_rev_",
+                                "tel": "13800138000"},
+                "buyer": "_rev_", "tel": "13800138000",
+                "clickPosition": {"x": random.randint(200,400),
+                    "y": random.randint(750,800),
+                    "origin": int(time.time()*1000)-random.randint(2000,8000),
+                    "now": int(time.time()*1000)},
+                "ctoken": generate_ctoken(),
+                "requestSource": "neul-next", "newRisk": True,
+            }
+
         mutations = [
-            # 格式敏感 (最优先)
-            ("clickPosition=str",
-             {"clickPosition": json.dumps(base["clickPosition"])},
-             "对象→字符串"),
-            ("clickPosition-缺失",
-             {"clickPosition": None},
-             "缺失clickPosition"),
-            # 指纹
-            ("-ctoken",
-             {"ctoken": None},
-             "缺失ctoken"),
-            ("ctoken=全零",
-             {"ctoken": base64.b64encode(b'\x00'*16).decode()},
-             "全零ctoken"),
-            # 请求源
-            ("requestSource=pc-new",
-             {"requestSource": "pc-new"},
-             "桌面端标记"),
-            ("-requestSource",
-             {"requestSource": None},
-             "缺失requestSource"),
-            # 标记位
-            ("-newRisk",
-             {"newRisk": None},
-             "缺失newRisk"),
-            ("-version",
-             {"version": None},
-             "缺失version"),
-            # 联系人
-            ("-contactInfo",
-             {"contactInfo": None},
-             "缺失contactInfo"),
-            ("tel=空",
-             {"tel": "", "contactInfo": {**base["contactInfo"], "tel": ""}},
-             "空手机号"),
-            # 价格
-            ("pay_money=1",
-             {"pay_money": 1},
-             "价格=1分"),
-            ("pay_money=0",
-             {"pay_money": 0},
-             "价格=0"),
-            # 杂项
-            ("+ptoken",
-             {"ptoken": self.ptoken or "fake"},
-             "带ptoken"),
-            ("id_bind=2",
-             {"id_bind": 2, "need_contact": 0,
-              "buyer_info": json.dumps([{"name": "x", "id_card": "110101199001011234", "phone": "13800138000"}])},
-             "实名票"),
+            ("clickPosition=str", {"clickPosition": json.dumps({"x":255,"y":750,"origin":now_ms-5000,"now":now_ms})}),
+            ("clickPosition-缺失", {"clickPosition": None}),
+            ("-ctoken", {"ctoken": None}),
+            ("ctoken=全零", {"ctoken": base64.b64encode(b'\x00'*16).decode()}),
+            ("requestSource=pc-new", {"requestSource": "pc-new"}),
+            ("-requestSource", {"requestSource": None}),
+            ("-newRisk", {"newRisk": None}),
+            ("-version", {"version": None}),
+            ("-contactInfo", {"contactInfo": None}),
+            ("tel=空", {"tel": "", "contactInfo": {"uid": self.uid, "username": "_rev_", "tel": ""}}),
+            ("pay_money=1", {"pay_money": 1}),
+            ("pay_money=0", {"pay_money": 0}),
+            ("+ptoken", {"ptoken": self.ptoken or "fake"}),
+            ("id_bind=2", {"id_bind": 2, "need_contact": 0,
+                "buyer_info": json.dumps([{"name":"x","id_card":"110101199001011234","phone":"13800138000"}])}),
         ]
 
-        # 清理 None 值 (不能直接传 None, 要从 payload 中移除)
-        cleaned = []
-        for name, overrides, desc in mutations:
-            clean = {}
-            for k, v in overrides.items():
-                if v is None:
-                    clean[k] = None  # signal to remove key
-                else:
-                    clean[k] = v
-            cleaned.append((name, clean, desc))
+        base = _make_base()
 
-        return self.diff_test("createV2", url, base, cleaned, first_only=False)
+        # 先跑基线
+        resp = self._send(url, base)
+        baseline_errno = resp.get("errno")
+        baseline_ok = baseline_errno in (0, 100048) or bool((resp.get("data",{}) or {}).get("orderId"))
+        print(f"\n  [基线] errno={baseline_errno} {'✓' if baseline_ok else '✗'}"
+              f" pid={self.pid}")
+
+        if not baseline_ok:
+            print("  基线失败, 无法继续差分测试")
+            return []
+
+        # 如果需要轮换, 先发现备用项目
+        fallback_pids = []
+        if rotate:
+            print(f"  正在发现备用项目 (用于限流轮换)...")
+            fallback_pids = self.discover_fallback_projects(count=len(mutations))
+            print(f"  找到 {len(fallback_pids)} 个备用项目: {fallback_pids}")
+
+        tested = 1
+        for i, (name, overrides) in enumerate(mutations):
+            payload = {**base, **overrides}
+            # remove None values
+            payload = {k: v for k, v in payload.items() if v is not None}
+            resp = self._send(url, payload)
+            errno = resp.get("errno")
+            msg = resp.get("msg", resp.get("message", ""))
+            oid = (resp.get("data", {}) or {}).get("orderId", "")
+            is_rl = "拥堵" in (msg or "") or errno == 900001
+            ok = errno in (0, 100048) or bool(oid)
+
+            mark = "✓" if ok else ("∅" if is_rl else "✗")
+            detail = f"orderId={oid}" if oid else msg[:40]
+            print(f"  [{i+1}/{len(mutations)}] {mark} {name:25s} → "
+                  f"errno={errno} {detail}  pid={self.pid}")
+
+            tested += 1
+            self._record(f"diff:createV2", {
+                "variant": name, "errno": errno, "msg": msg,
+                "passed": ok, "rate_limited": is_rl, "pid": self.pid,
+            })
+
+            # 限流 → 换项目继续
+            if is_rl and fallback_pids:
+                switched = False
+                for fp in fallback_pids:
+                    if self._switch_project(fp):
+                        fallback_pids.remove(fp)
+                        url = f"https://show.bilibili.com/api/ticket/order/createV2?project_id={self.pid}"
+                        base = _make_base()
+                        print(f"  → 切换项目: {self.pid} ({self.project.get('name','')[:20]})")
+                        switched = True
+                        break
+                if not switched:
+                    remaining = len(mutations) - i - 1
+                    print(f"  ⚠ 无可用备用项目, 剩余 {remaining} 变体无法测试")
+                    break
+
+        print(f"\n  测试 {tested}/{len(mutations)+1} 变体 ({len(fallback_pids)} 备用项目)")
 
     # ── 错误码穷举 ──
 
