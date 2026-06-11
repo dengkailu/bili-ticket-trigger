@@ -918,10 +918,19 @@ def interactive_menu():
 
     def _prompt(msg, default=""):
         val = input(f"  {msg}" + (f" [{default}]" if default else "") + ": ").strip()
+        if not val and not default:
+            return None  # 空输入 = 返回上一级
         return val if val else default
 
     def _clear():
         os.system("clear" if os.name == "posix" else "cls")
+
+    _C = {  # ANSI 色码
+        "R": "\033[91m", "G": "\033[92m", "Y": "\033[93m",
+        "B": "\033[94m", "M": "\033[95m", "C": "\033[96m",
+        "W": "\033[97m", "D": "\033[90m", "X": "\033[0m",
+    }
+    def _c(color, text): return f"{_C.get(color,'')}{text}{_C['X']}"
 
     def _ensure_api():
         nonlocal api, logged_in, login_name
@@ -939,28 +948,32 @@ def interactive_menu():
 
     while True:
         _clear()
-        print(f"\n{' B站会员购抢票工具 ':━^60}")
-        print(f"  登录: {'✓ ' + (login_name if logged_in else '') if logged_in else '✗ 未登录'}")
-        print(f"  购票人: {len(load_buyers())} 人")
+        print(f"\n{_c('C', '  B站会员购抢票工具 '):━^60}")
+        status_color = "G" if logged_in else "R"
+        print(f"  登录: {_c(status_color, '✓ ' + login_name if logged_in else '✗ 未登录')}")
+        print(f"  购票人: {_c('Y', str(len(load_buyers())))} 人")
         proxy = cfg.get("proxy", {})
         if proxy.get("enabled"):
-            print(f"  代理: {proxy.get('http', '已启用')}")
+            print(f"  代理: {_c('G', proxy.get('http', '已启用'))}")
         notify = cfg.get("notification", {})
         if notify.get("enabled"):
-            print(f"  通知: {'TG/飞书' if notify.get('tg_token') and notify.get('feishu_webhook') else 'TG' if notify.get('tg_token') else '飞书'}")
-        print(f"{'─' * 60}")
-        print(f"  [1] 扫码登录        [2] 验证登录状态")
-        print(f"  [3] 管理购票人      [4] 从B站获取实名观演人")
-        print(f"  [5] 查看项目详情    [6] 查看可购票档")
-        print(f"  [7] 监控票档        [8] 抢票 (dry-run / 真实)")
-        print(f"  [9] 接口诊断        [R] API逆向工程")
-        print(f"  [A] 代理/通知配置    [0] 退出")
-        print(f"{'─' * 60}")
+            ch = "/".join([c for c in ["TG", "飞书"] if notify.get({"TG":"tg_token","飞书":"feishu_webhook"}[c])])
+            print(f"  通知: {_c('G', ch)}")
+        print(f"{_c('D', '─' * 60)}")
+        print(f"  {_c('W','[1]')} 扫码登录        {_c('W','[2]')} 验证登录状态")
+        print(f"  {_c('W','[3]')} 管理购票人      {_c('W','[4]')} 从B站获取实名观演人")
+        print(f"  {_c('W','[5]')} 查看项目详情    {_c('W','[6]')} 查看可购票档")
+        print(f"  {_c('W','[7]')} 监控票档        {_c('W','[8]')} 抢票 (dry-run / 真实)")
+        print(f"  {_c('W','[9]')} 接口诊断        {_c('W','[R]')} API逆向工程")
+        print(f"  {_c('W','[A]')} 代理/通知配置    {_c('D','[0] 退出')}")
+        print(f"{_c('D', '─' * 60)}")
 
-        choice = _prompt("选择").strip().upper()
+        choice = _prompt(f"{_c('Y', '选择')} (回车=退出)")
+        if choice is None:
+            break
+        choice = choice.strip().upper()
         _clear()
         need_pause = True
-
         try:
             if choice == "1":
                 cmd_login(None)
@@ -975,22 +988,25 @@ def interactive_menu():
             elif choice == "3":
                 while True:
                     buyers = load_buyers()
-                    print(f"\n  {' 购票人管理 ':━^40}")
-                    print(f"  [1] 添加    [2] 列表 ({len(buyers)}人)    [3] 删除    [0] 返回")
+                    print(f"\n  {_c('C', '购票人管理'):━^44}")
+                    print(f"  {_c('W','[1]')} 添加    {_c('W','[2]')} 列表 ({len(buyers)}人)    {_c('W','[3]')} 删除    "
+                          f"{_c('D','[回车] 返回')}")
                     sub = _prompt("选择")
+                    if sub is None:
+                        break
                     if sub == "1":
-                        print(f"  输入购票人信息:")
+                        print(f"  {_c('Y','输入购票人信息 (回车=返回)')}")
                         name = _prompt("姓名")
-                        if not name:
-                            continue
+                        if name is None:
+                            break
                         id_card = _prompt("身份证号")
-                        if not id_card:
-                            continue
+                        if id_card is None:
+                            break
                         phone = _prompt("手机号 (可选)")
                         buyers = load_buyers()
                         buyers.append({"name": name, "id_card": id_card, "phone": phone})
                         save_buyers(buyers)
-                        print(f"  ✓ 已保存: {name}")
+                        print(f"  {_c('G','✓')} 已保存: {name}")
                     elif sub == "2":
                         buyers = load_buyers()
                         if not buyers:
@@ -1003,16 +1019,17 @@ def interactive_menu():
                         buyers = load_buyers()
                         if buyers:
                             idx = _prompt("序号")
+                            if idx is None:
+                                continue
                             try:
                                 idx = int(idx) - 1
                                 if 0 <= idx < len(buyers):
                                     r = buyers.pop(idx)
                                     save_buyers(buyers)
-                                    print(f"  ✓ 已删除: {r['name']}")
+                                    print(f"  {_c('G','✓')} 已删除: {r['name']}")
                             except ValueError:
                                 pass
                     elif sub == "0":
-                        need_pause = False
                         break
 
             elif choice == "4":
@@ -1183,46 +1200,55 @@ def interactive_menu():
 
             elif choice in ("A", "a"):
                 while True:
-                    print(f"\n  {' 配置 ':━^40}")
-                    print(f"  [1] 设置/查看代理")
-                    print(f"  [2] 设置 Telegram 通知")
-                    print(f"  [3] 设置飞书通知")
-                    print(f"  [4] 启用/禁用通知")
-                    print(f"  [0] 返回")
+                    print(f"\n  {_c('C', '配置'):━^44}")
+                    print(f"  {_c('W','[1]')} 设置/查看代理")
+                    print(f"  {_c('W','[2]')} 设置 Telegram 通知")
+                    print(f"  {_c('W','[3]')} 设置飞书通知")
+                    print(f"  {_c('W','[4]')} 启用/禁用通知")
+                    print(f"  {_c('D','[回车] 返回')}")
                     sub = _prompt("选择")
+                    if sub is None:
+                        break
                     cfg = load_config()
                     if sub == "1":
                         proxy = cfg.get("proxy", {})
-                        print(f"  代理: {'启用' if proxy.get('enabled') else '禁用'}")
-                        print(f"  HTTP: {proxy.get('http', '(未设)')}")
-                        http = _prompt("新HTTP代理 (空=不变)")
+                        print(f"  代理: {_c('G' if proxy.get('enabled') else 'D', '启用' if proxy.get('enabled') else '禁用')}")
+                        print(f"  HTTP: {proxy.get('http', _c('D','(未设)'))}")
+                        http = _prompt(f"新HTTP代理 ({_c('D','回车=跳过')})")
                         if http:
                             proxy["http"] = http
                             proxy["https"] = _prompt("HTTPS代理 (空=同HTTP)") or http
                             proxy["enabled"] = True
                             cfg["proxy"] = proxy
                             save_config(cfg)
-                            print(f"  ✓ 已设置")
+                            print(f"  {_c('G','✓')} 已设置")
                     elif sub == "2":
                         token = _prompt("Bot Token")
+                        if token is None:
+                            continue
                         chat_id = _prompt("Chat ID")
+                        if chat_id is None:
+                            continue
                         if token and chat_id:
                             cfg["notification"]["tg_token"] = token
                             cfg["notification"]["tg_chat_id"] = chat_id
                             cfg["notification"]["enabled"] = True
                             save_config(cfg)
-                            print(f"  ✓ Telegram 已配置")
+                            print(f"  {_c('G','✓')} Telegram 已配置")
                     elif sub == "3":
                         webhook = _prompt("Webhook URL")
+                        if webhook is None:
+                            continue
                         if webhook:
                             cfg["notification"]["feishu_webhook"] = webhook
                             cfg["notification"]["enabled"] = True
                             save_config(cfg)
-                            print(f"  ✓ 飞书已配置")
+                            print(f"  {_c('G','✓')} 飞书已配置")
                     elif sub == "4":
                         cfg["notification"]["enabled"] = not cfg["notification"].get("enabled", False)
                         save_config(cfg)
-                        print(f"  通知: {'启用' if cfg['notification']['enabled'] else '禁用'}")
+                        st = _c('G','启用') if cfg['notification']['enabled'] else _c('D','禁用')
+                        print(f"  通知: {st}")
                     elif sub == "0":
                         need_pause = False
                         break
