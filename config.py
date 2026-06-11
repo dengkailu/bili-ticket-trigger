@@ -4,6 +4,7 @@ B站会员购抢票工具 - 配置模块
 
 import json
 import os
+import random
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -17,8 +18,9 @@ DEFAULT_CONFIG = {
     "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     "proxy": {
         "enabled": False,
-        "http": "",
-        "https": "",
+        "mode": "single",
+        "url": "",
+        "pool": [],
     },
     "notification": {
         "enabled": False,
@@ -58,15 +60,44 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def get_proxy(config: dict = None) -> dict:
-    """构建 requests 可用的代理字典"""
-    if config is None:
-        config = load_config()
-    proxy_cfg = config.get("proxy", {})
-    if not proxy_cfg.get("enabled"):
+class ProxyRotator:
+    """代理池轮转器 — 每次请求随机选一个"""
+
+    def __init__(self, config: dict = None):
+        if config is None:
+            config = load_config()
+        self._cfg = config.get("proxy", {})
+        self._pool = list(self._cfg.get("pool", []))
+        self._idx = 0
+        self._single = self._cfg.get("url", "")
+        self._mode = self._cfg.get("mode", "single")
+        self._enabled = self._cfg.get("enabled", False)
+
+    def next(self) -> dict:
+        """返回 requests 兼容的代理字典, 每次随机选"""
+        if not self._enabled:
+            return None
+        url = None
+        if self._mode == "pool" and self._pool:
+            url = random.choice(self._pool)
+        elif self._single:
+            url = self._single
+        if url:
+            return {"http": url, "https": url}
         return None
-    proxies = {}
-    if proxy_cfg.get("http"):
-        proxies["http"] = proxy_cfg["http"]
-        proxies["https"] = proxy_cfg.get("https") or proxy_cfg["http"]
-    return proxies or None
+
+    @property
+    def active(self) -> bool:
+        return self._enabled and bool(self._single or self._pool)
+
+    def current_url(self) -> str:
+        if self._mode == "pool" and self._pool:
+            return f"pool ({len(self._pool)} nodes)"
+        return self._single or "(未设置)"
+
+
+def get_proxy(config: dict = None) -> dict:
+    """兼容旧接口"""
+    rotator = ProxyRotator(config)
+    return rotator.next()
+

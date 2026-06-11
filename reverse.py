@@ -59,6 +59,8 @@ class APIReverser:
         else:
             self.sid = 0
             self.sku = 0
+            self.pay_money = 1000
+            self.ticket_desc = "(无可购票档)"
 
         # 备用项目列表 (用于限流时轮换)
         self.fallback_pids = []

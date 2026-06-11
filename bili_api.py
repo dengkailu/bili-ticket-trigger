@@ -34,7 +34,7 @@ from typing import Optional, Tuple
 
 import requests
 
-from config import load_config, save_config, get_proxy
+from config import load_config, save_config, ProxyRotator
 
 BUYERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buyers.json")
 
@@ -208,6 +208,21 @@ def _to_binary(data: bytearray) -> str:
     return base64.b64encode(bytes(result)).decode()
 
 
+APP_KEY = "1d8b6e7d45233436"
+APP_SECRET = "560c52ccd288fed045859ed18bffd973"
+
+
+def _app_sign(params: dict) -> dict:
+    """B站 App 请求签名 (HMAC-MD5)"""
+    import hashlib
+    p = {"appkey": APP_KEY, **params}
+    p = dict(sorted(p.items()))
+    qs = "&".join(f"{k}={v}" for k, v in p.items())
+    sign = hashlib.md5((qs + APP_SECRET).encode()).hexdigest()
+    p["sign"] = sign
+    return p
+
+
 class BiliTicketAPI:
     """B站会员购票务 API 客户端"""
 
@@ -258,6 +273,8 @@ class BiliTicketAPI:
             self._app_model = ""
             self._app_version = ""
 
+        self._proxy_rotator = ProxyRotator(cfg)
+
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": self.ua,
@@ -265,9 +282,8 @@ class BiliTicketAPI:
             "Origin": "https://show.bilibili.com",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9",
+            "Connection": "close",
         })
-
-        self._apply_proxy()
 
         if self.cookie:
             self._set_cookie(self.cookie)
@@ -275,10 +291,19 @@ class BiliTicketAPI:
         # App 模式: 注入设备指纹 Cookie
         if app_mode:
             self._init_app_cookies()
+            self._update_app_sign()
 
         self.csrf = self._extract_csrf()
         self.user_info = {}
         self.auth_verified = cfg.get("auth", {}).get("verified", False)
+
+    def _update_app_sign(self):
+        """注入 App 签名 Cookie"""
+        from urllib.parse import urlencode, quote
+        ts = int(time.time() * 1000)
+        signed = _app_sign({"ts": ts})
+        identify = quote(urlencode(signed))
+        self.session.cookies.set("identify", identify)
 
     def _init_app_cookies(self):
         """注入 Android App 设备指纹 Cookie (BHYG 方案)"""
@@ -302,9 +327,11 @@ class BiliTicketAPI:
             return f"platform/pc uid/{uid} deviceId/{self._extract_device_id()}"
 
         uid = self.config.get("auth", {}).get("uid", 0)
+        buvid = self.session.cookies.get("buvid3", "") or self._extract_device_id()
         parts = [
             f"appkey/1d8b6e7d45233436",
             f"brand/{self._app_brand}",
+            f"localBuvid/{buvid}",
             f"model/{self._app_model}",
             f"osver/15",
             f"platform/h5",
@@ -317,11 +344,6 @@ class BiliTicketAPI:
             f"mVersion/296",
         ]
         return " ".join(parts)
-
-    def _apply_proxy(self) -> None:
-        proxies = get_proxy(self.config)
-        if proxies:
-            self.session.proxies.update(proxies)
 
     def _set_cookie(self, cookie_str: str) -> None:
         for item in cookie_str.split(";"):
@@ -339,6 +361,12 @@ class BiliTicketAPI:
     def _request(self, method: str, path: str, **kwargs) -> dict:
         url = f"{self.base_url}{path}"
         kwargs.setdefault("timeout", self.timeout)
+        # 仅下单接口使用代理 (避免非下单请求浪费代理池)
+        if "order/" in path or "createV2" in path:
+            self._update_app_sign()
+            proxy = self._proxy_rotator.next()
+            if proxy:
+                kwargs["proxies"] = proxy
         for attempt in range(self.max_retries):
             try:
                 resp = self.session.request(method, url, **kwargs)
@@ -362,28 +390,27 @@ class BiliTicketAPI:
 
     @staticmethod
     def qrcode_login(show_func=None) -> Tuple[bool, str]:
-        """
-        扫码登录完整流程, 返回 (是否成功, cookie_string)
-
-        流程:
-          1. 生成二维码 (可选传入 show_func(url) 来展示)
-          2. 轮询扫码状态
-          3. 提取 Cookie (从 session + 确认 URL)
-        """
+        """扫码登录 — 使用 App UA 获取 App 类型 Cookie"""
         session = requests.Session()
+        # 用 Android App UA (和主 session 一致)
+        ua = (
+            "Mozilla/5.0 (Linux; Android 15; PKR110 Build/AQ3A.240912.001; wv) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+            "Chrome/131.0.6778.260 Mobile Safari/537.36 "
+            "BiliApp/8350200 mobi_app/android"
+        )
         session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": ua,
             "Referer": "https://www.bilibili.com",
         })
 
         r = session.get(
             "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
             timeout=10)
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            return False, "B站接口异常"
         if data.get("code") != 0:
             return False, f"生成二维码失败: {data.get('message')}"
 
@@ -393,35 +420,30 @@ class BiliTicketAPI:
         if show_func:
             show_func(qr_url)
 
-        start = time.time()
+        print(f"  [扫码] 请用 B站 App 扫描二维码")
         last_status = None
 
-        while time.time() - start < 180:
-            params = {"qrcode_key": qrcode_key}
+        while True:
+            time.sleep(1.5)
             try:
                 resp = session.get(
                     "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
-                    params=params, timeout=10)
+                    params={"qrcode_key": qrcode_key}, timeout=10)
                 inner = resp.json().get("data", {})
             except Exception as e:
                 return False, f"轮询异常: {e}"
 
             code = inner.get("code", -1)
-
             if code != last_status:
                 last_status = code
-                status_map = {
-                    86101: "等待扫码...",
-                    86090: "已扫码, 请在手机上确认",
-                    86038: "二维码已过期",
-                    0: "登录成功!",
-                }
+                status_map = {86101: "等待扫码...", 86090: "已扫码, 请在手机上确认",
+                              86038: "二维码已过期", 0: "登录成功!"}
                 print(f"  [{time.strftime('%H:%M:%S')}] "
                       f"{status_map.get(code, inner.get('message', '未知'))}")
 
             if code == 0:
                 cookies = dict(session.cookies)
-
+                # 从确认 URL 提取额外 Cookie
                 if inner.get("url"):
                     from urllib.parse import urlparse, parse_qs
                     qs = parse_qs(urlparse(inner["url"]).query)
@@ -438,9 +460,10 @@ class BiliTicketAPI:
             if code == 86038:
                 return False, "二维码已过期"
 
-            time.sleep(1.5)
-
-        return False, "登录超时"
+    @staticmethod
+    def playwright_login(show_func=None) -> Tuple[bool, str]:
+        """Playwright 登录 (备用)"""
+        return BiliTicketAPI.qrcode_login(show_func)
 
     def verify_auth(self) -> Tuple[bool, str, dict]:
         """验证 Cookie 是否有效, 返回 (是否成功, 用户名, 用户信息)"""
@@ -590,9 +613,8 @@ class BiliTicketAPI:
             f"/api/ticket/user/info?version={self.version}")
 
     def get_buyers_list(self) -> list:
-        """获取账号已绑定的实名观演人列表"""
-        data = self._request("GET",
-            f"/api/ticket/buyer/list?version={self.version}")
+        """获取B站已绑定的实名观演人"""
+        data = self._request("GET", "/api/ticket/buyer/list")
         if data.get("code") != 0 and data.get("errno") != 0:
             return []
         result = []
@@ -605,6 +627,16 @@ class BiliTicketAPI:
                 result.append({"id": str(bid), "name": name,
                                 "tel": str(tel), "id_card": str(id_card)})
         return result
+
+    def add_buyer(self, name: str, id_card: str, phone: str = "") -> dict:
+        """添加B站实名观演人"""
+        return self._request("POST", "/api/ticket/buyer/create",
+            json={"name": name, "id_card": id_card, "phone": phone})
+
+    def delete_buyer(self, buyer_id: str) -> dict:
+        """删除B站实名观演人"""
+        return self._request("POST", "/api/ticket/buyer/delete",
+            json={"id": buyer_id})
 
     # ── 验证码处理 ────────────────────────────────────────────
 
@@ -706,18 +738,27 @@ class BiliTicketAPI:
 
         if id_bind == 0:
             payload["contactInfo"] = {
-                "uid": self.config.get("auth", {}).get("uid", 0),
+                "uid": int(self.config.get("auth", {}).get("uid", 0)),
                 "username": buyer_name,
                 "tel": buyer_phone,
             }
             payload["buyer"] = buyer_name
             payload["tel"] = buyer_phone
         else:
-            payload["buyer_info"] = json.dumps([{
-                "name": buyer_name,
-                "id_card": buyer_id_card,
-                "phone": buyer_phone,
-            }]) if buyer_name else ""
+            # id_bind=2: 需要 B站 注册的 buyer ID
+            # buyer_info 格式: [{"id": "12720803", "name": "邓恺璐", ...}]
+            buyers = self.get_buyers_list()
+            matched = [b for b in buyers if b.get("id_card") == buyer_id_card or b.get("name") == buyer_name]
+            if matched:
+                payload["buyer_info"] = json.dumps(matched[:buy_num], ensure_ascii=False)
+            elif buyer_name and buyer_id_card:
+                payload["buyer_info"] = json.dumps([{
+                    "name": buyer_name,
+                    "id_card": buyer_id_card,
+                    "phone": buyer_phone,
+                }], ensure_ascii=False)
+            else:
+                payload["buyer_info"] = ""
 
         if ptoken:
             payload["ptoken"] = ptoken
@@ -801,7 +842,8 @@ class BiliTicketAPI:
         if code == 100048 or errno == 100048:
             return True, "成功(已有未完成订单)"
 
-        if any(k in msg for k in ("联系人信息", "姓名及手机号", "手机号")):
+        if any(k in msg for k in ("联系人信息", "姓名及手机号", "手机号",
+                                        "购买人信息", "请选择", "没有选择")):
             return False, "NEED_CONTACT"
 
         text = msg.lower()
@@ -845,6 +887,12 @@ class BiliTicketAPI:
                                   stay_time=random.randint(2000, 10000),
                                   is_create_v2=False)
 
+        # 缓存项目信息 (用于通知)
+        status, avail = self.check_ticket_available(project_id, sku_id=sku_id)
+        self._last_proj_name = status.get("name", "")
+        if avail:
+            self._last_ticket_desc = avail[0].get("desc", "")
+
         if dry_run:
             payload = {
                 "project_id": project_id, "screen_id": screen_id,
@@ -857,6 +905,11 @@ class BiliTicketAPI:
                 "requestSource": "neul-next", "newRisk": True,
                 "version": "1.1.0",
             }
+            if id_bind != 0 and buyer_id_card:
+                payload["buyer_info"] = json.dumps([{
+                    "name": buyer_name, "id_card": buyer_id_card,
+                    "phone": buyer_phone,
+                }])
             print(f"\n{' DRY-RUN 模拟下单 ':━^60}")
             print(f"  流程: prepare (获取token) → createV2 (下单)")
             print(f"  createV2 URL: /api/ticket/order/createV2?project_id={project_id}")
@@ -930,14 +983,19 @@ class BiliTicketAPI:
 
                 ok, reason = self.classify_response(order)
                 code = order.get("code")
+                errno = order.get("errno")
                 msg = order.get("message", order.get("msg", ""))
 
                 if ok:
-                    order_data = order.get("data", {})
-                    order_id = order_data.get("order_id", "")
-                    print(f"[成功 #{attempt}] order_id={order_id}")
-                    self._notify_success(order, buyer_name)
-                    return {"order_id": order_id, **order_data}
+                    od = order.get("data", {})
+                    oid = od.get("orderId", od.get("order_id", ""))
+                    pay = od.get("pay_money", od.get("payMoney", pay_money))
+                    print(f"[成功] order_id={oid} 金额=¥{pay/100:.2f}")
+                    self._notify_success(order, buyer_name,
+                        project_name=self._last_proj_name,
+                        ticket_desc=self._last_ticket_desc,
+                        count=buy_num, total_price=pay or pay_money)
+                    return {"order_id": oid, **od}
 
                 if reason == "RATE_LIMIT" or code in (412, 429) or errno in (412, 429):
                     print(f"[#{attempt}] code={code or errno} {msg[:40]}")
@@ -988,7 +1046,13 @@ class BiliTicketAPI:
 
                 # 412/429/900001/3 等全部不退避, 固定间隔死磕
                 print(f"[#{attempt}] code={code or errno} {msg[:40]}")
-                time.sleep(poll_interval)
+                # 被限流时动态加长间隔
+                delay = poll_interval
+                if code == 1 or "请慢一点" in msg:
+                    delay = poll_interval + random.uniform(0.5, 1.0)
+                elif code == 900001 or "拥堵" in msg:
+                    delay = poll_interval + random.uniform(0.3, 0.8)
+                time.sleep(delay)
 
             except requests.Timeout:
                 print(f"[超时 #{attempt}]")
@@ -1035,15 +1099,33 @@ class BiliTicketAPI:
             else:
                 time.sleep(0.003)
 
-    def _notify_success(self, order: dict, buyer_name: str) -> None:
+    def _notify_success(self, order: dict, buyer_name: str,
+                         project_name: str = "", ticket_desc: str = "",
+                         count: int = 1, total_price: int = 0) -> None:
+        """发送抢票成功通知 + 获取支付链接"""
         try:
             from notify import send_order_success
+            od = order.get("data", order)
+            oid = od.get("orderId", od.get("order_id", ""))
+
+            # 获取支付链接
+            pay_url = ""
+            try:
+                r = self._request("GET",
+                    f"/api/ticket/order/getPayParam?order_id={oid}")
+                if r.get("errno", r.get("code")) == 0:
+                    pay_url = (r.get("data", {}) or {}).get("code_url", "")
+            except Exception:
+                pass
+
             send_order_success(
-                order.get("data", order),
-                project_name="",
-                ticket_desc="",
+                od,
+                project_name=project_name,
+                ticket_desc=ticket_desc,
                 buyer_name=buyer_name,
-                config=self.config,
+                count=count, total_price=total_price,
+                pay_url=pay_url,
+                config=self.config.get("notification", {}),
             )
         except Exception as e:
             print(f"[通知] 发送失败: {e}")

@@ -600,8 +600,10 @@ def cmd_buy(args):
             buy_num=args.num,
             buyer_name=buyer_name,
             buyer_phone=buyer_phone,
+            buyer_id_card=args.id_card or "",
             pay_money=pay_money,
             dry_run=dry_run,
+            id_bind=status.get("id_bind", 0),
             token=args.token or "",
             wait_sale=bool(args.sale_time),
             sale_time_str=args.sale_time or "",
@@ -871,6 +873,7 @@ def main():
     p_buy.add_argument("--num", type=int, default=1, help="购买数量")
     p_buy.add_argument("--name", type=str, default="", help="购票人姓名")
     p_buy.add_argument("--phone", type=str, default="", help="手机号")
+    p_buy.add_argument("--id-card", type=str, default="", help="身份证号 (实名项目必需)")
     p_buy.add_argument("--token", type=str, default="",
                         help="下单 token (从浏览器 confirmOrder 页面 URL 提取)")
     p_buy.add_argument("--real", action="store_true",
@@ -954,18 +957,22 @@ def interactive_menu():
         print(f"  购票人: {_c('Y', str(len(load_buyers())))} 人")
         proxy = cfg.get("proxy", {})
         if proxy.get("enabled"):
-            print(f"  代理: {_c('G', proxy.get('http', '已启用'))}")
+            from config import ProxyRotator
+            pr = ProxyRotator(cfg)
+            label = pr.current_url()
+            print(f"  代理: {_c('G', label)} (仅下单使用)")
         notify = cfg.get("notification", {})
         if notify.get("enabled"):
             ch = "/".join([c for c in ["TG", "飞书"] if notify.get({"TG":"tg_token","飞书":"feishu_webhook"}[c])])
             print(f"  通知: {_c('G', ch)}")
+        if last_project:
+            print(f"  项目: {_c('D', str(last_project))}")
         print(f"{_c('D', '─' * 60)}")
         print(f"  {_c('W','[1]')} 扫码登录        {_c('W','[2]')} 验证登录状态")
-        print(f"  {_c('W','[3]')} 管理购票人      {_c('W','[4]')} 从B站获取实名观演人")
-        print(f"  {_c('W','[5]')} 查看项目详情    {_c('W','[6]')} 查看可购票档")
-        print(f"  {_c('W','[7]')} 监控票档        {_c('W','[8]')} 抢票 (dry-run / 真实)")
-        print(f"  {_c('W','[9]')} 接口诊断        {_c('W','[R]')} API逆向工程")
-        print(f"  {_c('W','[A]')} 代理/通知配置    {_c('D','[0] 退出')}")
+        print(f"  {_c('W','[3]')} 购票人管理      {_c('W','[4]')} 项目查询")
+        print(f"  {_c('W','[5]')} 监控票档        {_c('W','[6]')} 抢票")
+        print(f"  {_c('W','[7]')} 接口诊断        {_c('W','[8]')} API逆向工程")
+        print(f"  {_c('W','[9]')} 代理/通知配置    {_c('D','[0] 退出')}")
         print(f"{_c('D', '─' * 60)}")
 
         choice = _prompt(f"{_c('Y', '选择')} (回车=退出)")
@@ -976,7 +983,19 @@ def interactive_menu():
         need_pause = True
         try:
             if choice == "1":
-                cmd_login(None)
+                success, result = BiliTicketAPI.playwright_login(show_func=_show_qr)
+                if success:
+                    api = BiliTicketAPI(cookie=result)
+                    ok, uname, _ = api.verify_auth()
+                    if ok:
+                        logged_in = True
+                        login_name = uname
+                        print(f"\n  {' 登录成功! ':━^40}")
+                        print(f"  用户名: {uname}  |  Cookie: App 类型")
+                    else:
+                        print(f"  {_c('Y','Cookie 保存但验证失败: ' + uname)}")
+                else:
+                    print(f"  {_c('R','登录失败: ' + result)}")
 
             elif choice == "2":
                 if _ensure_api():
@@ -987,100 +1006,143 @@ def interactive_menu():
 
             elif choice == "3":
                 while True:
-                    buyers = load_buyers()
-                    print(f"\n  {_c('C', '购票人管理'):━^44}")
-                    print(f"  {_c('W','[1]')} 添加    {_c('W','[2]')} 列表 ({len(buyers)}人)    {_c('W','[3]')} 删除    "
-                          f"{_c('D','[回车] 返回')}")
-                    sub = _prompt("选择")
+                    print(f"\n  {_c('C', '购票人管理'):━^50}")
+                    # 显示B站实名观演人
+                    bili_buyers = []
+                    if api and api.is_authenticated():
+                        bili_buyers = api.get_buyers_list()
+                    print(f"  B站实名观演人 ({len(bili_buyers)}人):")
+                    for i, b in enumerate(bili_buyers, 1):
+                        ic = b.get("id_card", "")
+                        id_m = f" {ic[:3]}****{ic[-3:]}" if len(ic) > 6 else ""
+                        tel = b.get("tel", "")
+                        t_m = f" {tel[:3]}****{tel[-4:]}" if len(tel) == 11 else ""
+                        print(f"    [{i}] {b['name']}{id_m}{t_m}")
+                    if not bili_buyers:
+                        print(f"    {_c('D','(无)')}")
+
+                    # 本地购票人
+                    local = load_buyers()
+                    print(f"\n  本地购票人 ({len(local)}人):")
+                    for i, b in enumerate(local, 1):
+                        ic = b.get("id_card", "")
+                        id_m = f" {ic[:3]}****{ic[-3:]}" if len(ic) > 6 else ""
+                        print(f"    [{i}] {b['name']}{id_m}  {b.get('phone', '')}")
+                    if not local:
+                        print(f"    {_c('D','(无)')}")
+
+                    print(f"\n  {_c('W','[+]')} 添加  {_c('W','[-]')} 删除  "
+                          f"{_c('W','[S]')} 同步到B站  {_c('D','[回车] 返回')}")
+                    sub = _prompt("操作")
                     if sub is None:
+                        need_pause = False
                         break
-                    if sub == "1":
-                        print(f"  {_c('Y','输入购票人信息 (回车=返回)')}")
+                    sub = sub.strip().lower()
+                    if sub in ("+", "add"):
+                        if not _ensure_api():
+                            print(f"  {_c('R','请先登录')}")
+                            continue
+                        print(f"  {_c('Y','添加购票人 (同时添加到B站)')}")
                         name = _prompt("姓名")
-                        if name is None:
-                            break
+                        if not name: continue
                         id_card = _prompt("身份证号")
-                        if id_card is None:
-                            break
-                        phone = _prompt("手机号 (可选)")
+                        if not id_card: continue
+                        phone = _prompt("手机号 (必填)")
+                        if not phone: continue
+                        # 添加到B站
+                        r = api.add_buyer(name, id_card, phone)
+                        if r.get("errno") == 0:
+                            bid = (r.get("data", {}) or {}).get("id", "")
+                            print(f"  {_c('G','✓')} 已添加到B站 (id={bid})")
+                        else:
+                            print(f"  {_c('Y','B站添加失败')}: {r.get('msg',r.get('message',''))}")
+                        # 同时保存本地
                         buyers = load_buyers()
                         buyers.append({"name": name, "id_card": id_card, "phone": phone})
                         save_buyers(buyers)
-                        print(f"  {_c('G','✓')} 已保存: {name}")
-                    elif sub == "2":
-                        buyers = load_buyers()
-                        if not buyers:
-                            print("  (空)")
-                        for i, b in enumerate(buyers, 1):
-                            ic = b.get("id_card", "")
-                            m = f"{ic[:3]}****{ic[-3:]}" if len(ic) > 6 else "***"
-                            print(f"  [{i}] {b['name']}  {m}  {b.get('phone', '')}")
-                    elif sub == "3":
-                        buyers = load_buyers()
-                        if buyers:
+                        print(f"  {_c('G','✓')} 本地已保存")
+                    elif sub in ("-", "del"):
+                        target = _prompt("删除B站(b)/本地(l)", "l").lower()
+                        if target == "b":
+                            if not _ensure_api(): continue
                             idx = _prompt("序号")
-                            if idx is None:
-                                continue
-                            try:
-                                idx = int(idx) - 1
-                                if 0 <= idx < len(buyers):
-                                    r = buyers.pop(idx)
-                                    save_buyers(buyers)
+                            if idx and idx.isdigit():
+                                i = int(idx) - 1
+                                if 0 <= i < len(bili_buyers):
+                                    r = api.delete_buyer(bili_buyers[i]["id"])
+                                    if r.get("errno") == 0:
+                                        print(f"  {_c('G','✓')} 已删除")
+                                    else:
+                                        print(f"  {_c('R','失败')}: {r.get('msg','')}")
+                        else:
+                            idx = _prompt("序号")
+                            if idx and idx.isdigit():
+                                i = int(idx) - 1
+                                if 0 <= i < len(local):
+                                    r = local.pop(i)
+                                    save_buyers(local)
                                     print(f"  {_c('G','✓')} 已删除: {r['name']}")
-                            except ValueError:
-                                pass
-                    elif sub == "0":
-                        break
+                    elif sub in ("s", "sync"):
+                        if not _ensure_api(): continue
+                        for b in local:
+                            existing = [x for x in bili_buyers if x.get("id_card") == b.get("id_card")]
+                            if not existing:
+                                r = api.add_buyer(b["name"], b["id_card"], b.get("phone", ""))
+                                if r.get("errno") == 0:
+                                    print(f"  {_c('G','✓')} 已同步: {b['name']}")
+                                else:
+                                    print(f"  {_c('Y','跳过')}: {b['name']} ({r.get('msg','')})")
+                        print(f"  {_c('G','✓')} 同步完成")
 
             elif choice == "4":
-                if not _ensure_api():
-                    print("  请先登录")
+                pid = _prompt("项目ID (或完整URL)", str(last_project) if last_project else "")
+                if not pid:
                     continue
-                bl = api.get_buyers_list()
-                if bl:
-                    print(f"\n  B站实名观演人 ({len(bl)}):")
-                    for b in bl:
-                        print(f"  [{b['id']}] {b['name']}  {b.get('tel','')[:3]}****")
-                    print(f"\n  如需导入为本地购票人, 请手动执行 buyer add")
-                else:
-                    print("  未获取到实名观演人 (可能未绑定)")
-
-            elif choice == "5":
-                pid = _prompt("项目ID (或完整URL)")
                 if "show.bilibili.com" in pid:
                     import re
                     m = re.search(r'id=(\d+)', pid)
                     pid = m.group(1) if m else pid
                 try:
                     pid = int(pid)
+                    last_project = pid
                 except ValueError:
                     print("  无效的项目ID")
                     continue
-                cmd_info(type("A", (), {"project_id": pid})())
-                last_project = pid
 
-            elif choice == "6":
-                if not last_project:
-                    pid = _prompt("项目ID")
-                    try:
-                        pid = int(pid)
-                        last_project = pid
-                    except ValueError:
-                        continue
+                from bili_api import PROJECT_SALE_FLAG_MAP, SALE_FLAG_MAP, PROJECT_TYPE_MAP
+                api2 = BiliTicketAPI()
+                data = api2.get_project_summary(pid)
+                status, avail = api2.check_ticket_available(pid)
+
+                if not data:
+                    continue
+
+                p = data
+                sf = PROJECT_SALE_FLAG_MAP.get(p.get("sale_flag_number", -1), "未知")
+                venue = p.get("venue_info", {})
+                ptype = PROJECT_TYPE_MAP.get(p.get("type", 0), "未知")
+                idb = "需要(身份证+手机)" if p.get("id_bind") else "不需要"
+
+                print(f"\n{_c('C', ' 项目详情 '):━^60}")
+                print(f"  {p.get('name')}  |  {ptype}  |  {sf}")
+                print(f"  {venue.get('province_name','')}{venue.get('city_name','')} {venue.get('name')} {venue.get('address_detail','')}")
+                print(f"  实名: {idb}  |  退票: {p.get('refund_desc','')}  |  票价: ¥{p.get('price_low',0)/100:.0f}-¥{p.get('price_high',0)/100:.0f}")
+                print(f"  时间: {p.get('project_label','')}  |  想看: {p.get('wish_info',{}).get('count',0)}人")
+
+                # 统一表格: 场次 + 票档
+                if avail:
+                    print(f"\n  {'SKU':>8}  {'场次':<20}  {'票档':<12}  {'单价':>6}  {'状态':<6}  {'余量'}")
+                    print(f"  {'─'*68}")
+                    for s in avail:
+                        sc = s["screen_name"]
+                        d = s["desc"]
+                        print(f"  {s['sku_id']:>8}  {sc:<20}  {d:<12}  "
+                              f"¥{s['price_yuan']:>5.0f}  {'可购':<6}  {s['num']:>4}")
                 else:
-                    pid = _prompt("项目ID", str(last_project))
-                    try:
-                        pid = int(pid)
-                        last_project = pid
-                    except ValueError:
-                        pid = last_project
+                    print(f"\n  {_c('D','(无可购票档)')}")
+                print(f"  {_c('D', '(输入 [6] 开始抢票)')}")
 
-                cmd_check(type("A", (), {
-                    "project_id": pid, "sku_id": 0, "screen_id": 0,
-                    "min_price": 0, "max_price": 99999999
-                })())
-
-            elif choice == "7":
+            elif choice == "5":
                 if not last_project:
                     pid = int(_prompt("项目ID") or "0")
                     if not pid:
@@ -1096,7 +1158,7 @@ def interactive_menu():
                     "interval": interval,
                 })())
 
-            elif choice == "8":
+            elif choice == "6":
                 if not _ensure_api():
                     print("  请先登录")
                     continue
@@ -1140,35 +1202,72 @@ def interactive_menu():
 
                 num = int(_prompt("购买数量", "1") or "1")
 
-                buyers = load_buyers()
+                local = load_buyers()
                 buyer_name = ""
                 buyer_phone = ""
-                if buyers:
-                    print(f"\n  购票人:")
-                    for i, b in enumerate(buyers, 1):
-                        p = f" {b.get('phone', '')[:3]}****" if b.get("phone") else " 无手机号"
-                        print(f"  [{i}] {b['name']}{p}")
-                    print(f"  [0] 手动输入")
-                    b_idx = _prompt("选择", "1")
-                    try:
-                        b_idx = int(b_idx)
-                        if b_idx > 0:
-                            b = buyers[b_idx - 1]
-                            buyer_name = b["name"]
-                            buyer_phone = b.get("phone", "")
-                        else:
-                            buyer_name = _prompt("姓名")
-                            buyer_phone = _prompt("手机号")
-                    except (ValueError, IndexError):
-                        buyer_name = _prompt("姓名")
-                        buyer_phone = _prompt("手机号")
+                buyer_id_card = ""
+                selected_buyers = []
 
-                if not buyer_phone:
-                    buyer_phone = _prompt("手机号 (项目可能需要)")
+                if local:
+                    labels = []
+                    for b in local:
+                        p = b.get("phone", "")
+                        t_m = f" {p[:3]}****{p[-4:]}" if len(p) == 11 else " (无手机号)"
+                        ic = b.get("id_card", "")
+                        id_m = f" {ic[:3]}****{ic[-3:]}" if len(ic) > 6 else ""
+                        labels.append(f"{b['name']}{id_m}{t_m}")
+
+                    if num == 1:
+                        print(f"\n  本地购票人:")
+                        for i, lb in enumerate(labels, 1):
+                            print(f"  [{i}] {lb}")
+                        print(f"  [0] 手动输入")
+                        b_idx = _prompt("选择", "1")
+                        if b_idx is None: continue
+                        try:
+                            b_idx = int(b_idx)
+                            if b_idx > 0:
+                                selected_buyers = [local[b_idx - 1]]
+                        except (ValueError, IndexError):
+                            pass
+                    else:
+                        from checkbox import checkbox_prompt
+                        indices = checkbox_prompt(labels, max_select=num,
+                                                   prompt=f"勾选 {num} 位购票人")
+                        if indices:
+                            selected_buyers = [local[i] for i in indices]
+                        else:
+                            continue
+
+                if not selected_buyers:
+                    bili_buyers = api.get_buyers_list()
+                    if bili_buyers:
+                        print(f"\n  {_c('D','(B站实名, 手机脱敏仅供参考)')}")
+                        for b in bili_buyers:
+                            print(f"    {b['name']}")
+                    print(f"  {_c('Y','手动输入:')}")
+                    buyer_name = _prompt("姓名")
+                    if not buyer_name: continue
+                    buyer_phone = _prompt("手机号")
+                    if not buyer_phone: continue
+                    buyer_id_card = _prompt("身份证号 (实名项目必填)")
+                    if buyer_id_card is None:
+                        buyer_id_card = ""
+
+                if selected_buyers:
+                    b = selected_buyers[0]
+                    buyer_name = b["name"]
+                    buyer_phone = b.get("phone", "")
+                    buyer_id_card = b.get("id_card", "")
 
                 real = _prompt("真实下单? (y=下单, 其他=dry-run)", "n").lower() in ("y", "yes")
                 sale_time = _prompt("开售时间 (如2026-06-10 18:00, 空=立即)", "")
                 max_retry = int(_prompt("每token重试次数", "60") or "60")
+                poll_interval = float(_prompt("重试间隔(秒)", "1.5") or "1.5")
+
+                proj_id_bind = status.get("id_bind", 0)
+                if proj_id_bind == 2:
+                    print(f"  {_c('Y','⚠ 该项目需要实名 (身份证), 请确保购票人已录入身份证号')}")
 
                 api2.sniper_buy(
                     project_id=pid,
@@ -1177,14 +1276,17 @@ def interactive_menu():
                     buy_num=num,
                     buyer_name=buyer_name,
                     buyer_phone=buyer_phone,
+                    buyer_id_card=buyer_id_card,
                     pay_money=int(target.get("price", 0)),
                     dry_run=not real,
+                    id_bind=status.get("id_bind", 0),
                     wait_sale=bool(sale_time),
                     sale_time_str=sale_time or "",
                     max_retry_per_token=max_retry,
+                    poll_interval=poll_interval,
                 )
 
-            elif choice == "9":
+            elif choice == "7":
                 pid = int(_prompt("项目ID") or "0")
                 if not pid:
                     continue
@@ -1192,63 +1294,144 @@ def interactive_menu():
                     "project_id": pid, "screen_id": 0, "sku_id": 0
                 })())
 
-            elif choice in ("R", "r"):
+            elif choice == "8":
                 import subprocess
                 pid = int(_prompt("项目ID", str(last_project or 1001227)) or "1001227")
                 print(f"\n  启动逆向工程 (python reverse.py {pid} --quick)...\n")
                 subprocess.run([sys.executable, "reverse.py", str(pid), "--quick"])
 
-            elif choice in ("A", "a"):
+            elif choice == "9":
                 while True:
                     print(f"\n  {_c('C', '配置'):━^44}")
-                    print(f"  {_c('W','[1]')} 设置/查看代理")
-                    print(f"  {_c('W','[2]')} 设置 Telegram 通知")
-                    print(f"  {_c('W','[3]')} 设置飞书通知")
-                    print(f"  {_c('W','[4]')} 启用/禁用通知")
+                    print(f"  {_c('W','[1]')} 代理配置")
+                    print(f"  {_c('W','[2]')} 通知配置")
                     print(f"  {_c('D','[回车] 返回')}")
                     sub = _prompt("选择")
                     if sub is None:
                         break
                     cfg = load_config()
                     if sub == "1":
-                        proxy = cfg.get("proxy", {})
-                        print(f"  代理: {_c('G' if proxy.get('enabled') else 'D', '启用' if proxy.get('enabled') else '禁用')}")
-                        print(f"  HTTP: {proxy.get('http', _c('D','(未设)'))}")
-                        http = _prompt(f"新HTTP代理 ({_c('D','回车=跳过')})")
-                        if http:
-                            proxy["http"] = http
-                            proxy["https"] = _prompt("HTTPS代理 (空=同HTTP)") or http
-                            proxy["enabled"] = True
-                            cfg["proxy"] = proxy
-                            save_config(cfg)
-                            print(f"  {_c('G','✓')} 已设置")
+                        while True:
+                            proxy = cfg.get("proxy", {})
+                            mode = proxy.get("mode", "single")
+                            pool = proxy.get("pool", [])
+                            url = proxy.get("url", "")
+                            print(f"\n  代理: {_c('G' if proxy.get('enabled') else 'D', '启用' if proxy.get('enabled') else '禁用')}")
+                            print(f"  模式: {mode} ({'每请求随机换节点' if mode == 'pool' and pool else '固定节点'})")
+                            if mode == "pool" and pool:
+                                print(f"  节点池 ({len(pool)}):")
+                                for i, p in enumerate(pool, 1):
+                                    print(f"    [{i}] {p}")
+                            elif url:
+                                print(f"  地址: {url}")
+                            print(f"  {_c('W','[1]')} 设置单节点  {_c('W','[2]')} 添加节点到池  "
+                                  f"{_c('W','[3]')} 清空节点池")
+                            print(f"  {_c('W','[4]')} 切换启用/禁用  {_c('W','[T]')} 测试代理")
+                            print(f"  {_c('D','[回车] 返回')}")
+                            act = _prompt("操作")
+                            if act is None:
+                                break
+                            if act == "1":
+                                url = _prompt("代理地址 (如 http://127.0.0.1:7890)")
+                                if url:
+                                    proxy["url"] = url
+                                    proxy["mode"] = "single"
+                                    proxy["enabled"] = True
+                                    cfg["proxy"] = proxy
+                                    save_config(cfg)
+                                    print(f"  {_c('G','✓')} 已设置: {url}")
+                                else:
+                                    print(f"  {_c('D','已取消')}")
+                            elif act == "2":
+                                url = _prompt("代理地址")
+                                if url:
+                                    pool = list(proxy.get("pool", []))
+                                    if url not in pool:
+                                        pool.append(url)
+                                    proxy["pool"] = pool
+                                    proxy["mode"] = "pool"
+                                    proxy["enabled"] = True
+                                    cfg["proxy"] = proxy
+                                    save_config(cfg)
+                                    print(f"  {_c('G','✓')} 已添加 (池: {len(pool)} 个节点)")
+                            elif act == "3":
+                                proxy["pool"] = []
+                                proxy["mode"] = "single"
+                                cfg["proxy"] = proxy
+                                save_config(cfg)
+                                print(f"  {_c('G','✓')} 已清空")
+                            elif act == "4":
+                                proxy["enabled"] = not proxy.get("enabled", False)
+                                cfg["proxy"] = proxy
+                                save_config(cfg)
+                                st = _c('G','启用') if proxy['enabled'] else _c('D','禁用')
+                                print(f"  代理: {st}")
+                            elif act in ("T", "t"):
+                                from config import ProxyRotator
+                                pr = ProxyRotator(cfg)
+                                if not pr.active:
+                                    print(f"  {_c('Y','代理未启用或未配置')}")
+                                else:
+                                    print(f"  正在测试...")
+                                    try:
+                                        import requests
+                                        r = requests.get("https://show.bilibili.com",
+                                            proxies=pr.next(), timeout=8)
+                                        print(f"  {_c('G','✓')} B站可访问 (代理正常)")
+                                    except Exception as e:
+                                        print(f"  {_c('R','✗')} 代理不可用: {e}")
+                                _prompt(f"{_c('D','按回车继续')}", " ")
                     elif sub == "2":
-                        token = _prompt("Bot Token")
-                        if token is None:
-                            continue
-                        chat_id = _prompt("Chat ID")
-                        if chat_id is None:
-                            continue
-                        if token and chat_id:
-                            cfg["notification"]["tg_token"] = token
-                            cfg["notification"]["tg_chat_id"] = chat_id
-                            cfg["notification"]["enabled"] = True
-                            save_config(cfg)
-                            print(f"  {_c('G','✓')} Telegram 已配置")
-                    elif sub == "3":
-                        webhook = _prompt("Webhook URL")
-                        if webhook is None:
-                            continue
-                        if webhook:
-                            cfg["notification"]["feishu_webhook"] = webhook
-                            cfg["notification"]["enabled"] = True
-                            save_config(cfg)
-                            print(f"  {_c('G','✓')} 飞书已配置")
-                    elif sub == "4":
-                        cfg["notification"]["enabled"] = not cfg["notification"].get("enabled", False)
-                        save_config(cfg)
-                        st = _c('G','启用') if cfg['notification']['enabled'] else _c('D','禁用')
-                        print(f"  通知: {st}")
+                        while True:
+                            n = cfg.get("notification", {})
+                            tg_ok = bool(n.get("tg_token"))
+                            fs_ok = bool(n.get("feishu_webhook"))
+                            print(f"\n  {_c('C','通知配置'):━^44}")
+                            print(f"  TG: {_c('G' if tg_ok else 'D', '已配置' if tg_ok else '未配置')}  |  "
+                                  f"飞书: {_c('G' if fs_ok else 'D', '已配置' if fs_ok else '未配置')}  |  "
+                                  f"状态: {_c('G' if n.get('enabled') else 'D', '启用' if n.get('enabled') else '禁用')}")
+                            print(f"  {_c('W','[1]')} Telegram  {_c('W','[2]')} 飞书  "
+                                  f"{_c('W','[3]')} 开关  {_c('W','[T]')} 测试消息")
+                            print(f"  {_c('D','[回车] 返回')}")
+                            act = _prompt("操作")
+                            if act is None:
+                                break
+                            if act == "1":
+                                token = _prompt("Bot Token")
+                                if token:
+                                    chat_id = _prompt("Chat ID")
+                                    if chat_id:
+                                        n["tg_token"] = token
+                                        n["tg_chat_id"] = chat_id
+                                        n["enabled"] = True
+                                        cfg["notification"] = n
+                                        save_config(cfg)
+                                        print(f"  {_c('G','✓')} Telegram 已配置")
+                            elif act == "2":
+                                webhook = _prompt("Webhook URL")
+                                if webhook:
+                                    n["feishu_webhook"] = webhook
+                                    n["enabled"] = True
+                                    cfg["notification"] = n
+                                    save_config(cfg)
+                                    print(f"  {_c('G','✓')} 飞书已配置")
+                            elif act == "3":
+                                n["enabled"] = not n.get("enabled", False)
+                                cfg["notification"] = n
+                                save_config(cfg)
+                                st = _c('G','启用') if n['enabled'] else _c('D','禁用')
+                                print(f"  通知: {st}")
+                            elif act in ("T", "t"):
+                                from notify import send_order_success
+                                send_order_success(
+                                    {"orderId": "TEST000000"},
+                                    project_name="测试项目",
+                                    ticket_desc="测试票档  ×1张",
+                                    buyer_name="测试购票人",
+                                    count=1, total_price=9900,
+                                    pay_url="https://show.bilibili.com",
+                                    config=n,
+                                )
                     elif sub == "0":
                         need_pause = False
                         break
