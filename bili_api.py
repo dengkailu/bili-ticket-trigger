@@ -174,15 +174,52 @@ def generate_ctoken(touchend=0, scrollX=0, scrollY=0,
 class BiliTicketAPI:
     """B站会员购票务 API 客户端"""
 
-    def __init__(self, cookie: str = "", config: Optional[dict] = None):
+    # Android App 设备型号池 (来自 BHYG)
+    _DEVICE_MODELS = {
+        "OnePlus": ["PKR110","PJD110","PJZ110","PKU110","PJA110","PJF110","PJX110"],
+        "IQOO": ["V2329A", "V2408A", "V2307A", "V2304A", "V2254A"],
+        "HONOR": ["DVD-AN00", "PTP-AN20", "ROD2-W69", "ROD2-W09", "ROL-W00"],
+        "Vivo": ["V2324A", "V2229A", "V2241A", "V2359A", "V2454A"],
+        "OPPO": ["PFFM20", "PJJ110", "PJW110", "PKM110", "PHU110"],
+        "Realme": ["RMX5060", "RMX3946", "RMX3948", "RMX5010"],
+    }
+
+    def __init__(self, cookie: str = "", config: Optional[dict] = None, app_mode: bool = True):
         cfg = config or load_config()
         self.base_url = cfg["base_url"]
         self.version = cfg["version"]
         self.timeout = cfg["request_timeout"]
         self.max_retries = cfg["max_retries"]
-        self.ua = cfg["user_agent"]
         self.cookie = cookie or cfg.get("cookie", "")
         self.config = cfg
+        self.app_mode = app_mode
+
+        # App 模式: 随机选一台真机型号
+        if app_mode:
+            brand = random.choice(list(self._DEVICE_MODELS.keys()))
+            model = random.choice(self._DEVICE_MODELS[brand])
+            self._app_brand = brand
+            self._app_model = model
+            self._app_version = "8350200"
+            self._app_version_name = "8.35.0"
+            self._screen_info = "362*795*24"
+            self._build_id = f"{random.choice('AB')}P{random.randint(1,4)}A.240{random.randint(1,9)}{random.randint(1,2)}{random.randint(1,9)}.0{random.randint(1,2)}{random.randint(1,9)}"
+
+            self.ua = (
+                f"Mozilla/5.0 (Linux; Android 15; {model} Build/{self._build_id}; wv) "
+                f"AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+                f"Chrome/135.0.7049.{random.randint(1,150)} Mobile Safari/537.36 "
+                f"BiliApp/{self._app_version} mobi_app/android "
+                f"isNotchWindow/1 NotchHeight={random.randint(20,40)} "
+                f"mallVersion/{self._app_version} mVersion/296 "
+                f"disable_rcmd/0 "
+                f"magent/BILI_H5_ANDROID_15_{self._app_version_name}_{self._app_version}"
+            )
+        else:
+            self.ua = cfg["user_agent"]
+            self._app_brand = ""
+            self._app_model = ""
+            self._app_version = ""
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -198,9 +235,51 @@ class BiliTicketAPI:
         if self.cookie:
             self._set_cookie(self.cookie)
 
+        # App 模式: 注入设备指纹 Cookie
+        if app_mode:
+            self._init_app_cookies()
+
         self.csrf = self._extract_csrf()
         self.user_info = {}
         self.auth_verified = cfg.get("auth", {}).get("verified", False)
+
+    def _init_app_cookies(self):
+        """注入 Android App 设备指纹 Cookie (BHYG 方案)"""
+        fps = {
+            "canvasFp": hashlib.md5(str(random.random()).encode()).hexdigest(),
+            "webglFp": hashlib.md5(str(random.random()).encode()).hexdigest(),
+            "feSign": hashlib.md5(str(random.random()).encode()).hexdigest(),
+        }
+        for name, val in fps.items():
+            self.session.cookies.set(name, val)
+
+        self.session.cookies.set("msource", "bilibiliapp")
+        self.session.cookies.set("kfcSource", "bilibiliapp")
+        self.session.cookies.set("deviceFingerprint", self._extract_device_id())
+        self.session.cookies.set("screenInfo", self._screen_info)
+
+    def _gen_risk_header(self) -> str:
+        """生成 x-risk-header (App 模式)"""
+        if not self.app_mode:
+            uid = self.config.get("auth", {}).get("uid", 0)
+            return f"platform/pc uid/{uid} deviceId/{self._extract_device_id()}"
+
+        uid = self.config.get("auth", {}).get("uid", 0)
+        parts = [
+            f"appkey/1d8b6e7d45233436",
+            f"brand/{self._app_brand}",
+            f"model/{self._app_model}",
+            f"osver/15",
+            f"platform/h5",
+            f"uid/{uid}",
+            f"channel/1",
+            f"deviceId/{self._extract_device_id()}",
+            f"sLocale/zh_CN",
+            f"cLocale/zh_CN",
+            f"mallVersion/{self._app_version}",
+            f"mVersion/296",
+        ]
+        return " ".join(parts)
 
     def _apply_proxy(self) -> None:
         proxies = get_proxy(self.config)
@@ -607,10 +686,7 @@ class BiliTicketAPI:
             payload["voucher"] = captcha_voucher
 
         headers = self.session.headers.copy()
-        uid = self.config.get("auth", {}).get("uid", 0)
-        headers["x-risk-header"] = (
-            f"platform/pc uid/{uid} deviceId/{device_id}"
-        )
+        headers["x-risk-header"] = self._gen_risk_header()
         if token:
             headers["Referer"] = (
                 f"https://show.bilibili.com/platform/confirmOrder.html"
