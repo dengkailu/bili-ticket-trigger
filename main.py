@@ -576,7 +576,7 @@ def cmd_buy(args):
         print(f"  开售时间: {args.sale_time} (定时等待)")
     if args.token:
         print(f"  Token   : {args.token[:15]}...")
-    print(f"  最大重试: {args.max_retry}s")
+    print(f"  每token重试: {args.max_retry}次")
     print(f"{'─' * 60}")
 
     if proj_sale == 5 and not available:
@@ -606,7 +606,7 @@ def cmd_buy(args):
             wait_sale=bool(args.sale_time),
             sale_time_str=args.sale_time or "",
             poll_interval=args.interval,
-            max_retry_seconds=args.max_retry,
+            max_retry_per_token=args.max_retry,
         )
         if result:
             if result.get("dry_run"):
@@ -879,8 +879,8 @@ def main():
                         help="开售时间, 如 '2026-06-10 18:00:00' (定时等待)")
     p_buy.add_argument("--interval", type=float, default=0.3,
                         help="轮询/退避间隔 秒")
-    p_buy.add_argument("--max-retry", type=float, default=10.0,
-                        help="最大重试时长 秒 (默认 10s)")
+    p_buy.add_argument("--max-retry", type=int, default=60,
+                        help="每token重试次数 (默认 60)")
     p_buy.set_defaults(func=cmd_buy)
 
     args = parser.parse_args()
@@ -1144,7 +1144,7 @@ def interactive_menu():
 
                 real = _prompt("真实下单? (y=下单, 其他=dry-run)", "n").lower() in ("y", "yes")
                 sale_time = _prompt("开售时间 (如2026-06-10 18:00, 空=立即)", "")
-                max_retry = float(_prompt("最大重试(秒)", "10") or "10")
+                max_retry = int(_prompt("每token重试次数", "60") or "60")
 
                 api2.sniper_buy(
                     project_id=pid,
@@ -1157,7 +1157,7 @@ def interactive_menu():
                     dry_run=not real,
                     wait_sale=bool(sale_time),
                     sale_time_str=sale_time or "",
-                    max_retry_seconds=max_retry,
+                    max_retry_per_token=max_retry,
                 )
 
             elif choice == "9":

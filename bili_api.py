@@ -150,11 +150,7 @@ def generate_ctoken(touchend=0, scrollX=0, scrollY=0,
                      screenX=0, screenY=0,
                      screenWidth=362, screenHeight=795,
                      timer=0, ticket_collection_t=None):
-    """生成 ctoken 浏览器指纹 (B站 prepare 接口要求)
-
-    编码 16 项浏览器行为指标为 base64 二进制 token。
-    参考 BHYG bilibili_util.py:generate_ctoken
-    """
+    """生成 ctoken 浏览器指纹"""
     data = bytearray(b'\x00')
     for v in [touchend, scrollX, scrollY,
               visibilitychange, openWindow,
@@ -169,6 +165,27 @@ def generate_ctoken(touchend=0, scrollX=0, scrollY=0,
         else:
             data.append((v or 0) & 0xff)
     return base64.b64encode(data).decode()
+
+
+def generate_ptoken(ctoken_str: str, uid: int, timestamp: int) -> str:
+    """
+    生成 ptoken (热门项目必需, BW等)
+
+    算法推断 (来自 BHYG generate_ptoken 结构):
+      ptoken = base64( \x00 + ctoken_bytes + uid(4) + ts(4) )
+
+    逻辑: ptoken 是"带用户身份的 ctoken",
+          服务端用它关联浏览器指纹和用户账号,
+          防止指纹复用。
+
+    ⚠️ 待 BW2026 开售后验证, 当前为推断实现
+    """
+    ctoken_bytes = base64.b64decode(ctoken_str)
+    data = bytearray(b'\x00')
+    data.extend(ctoken_bytes)
+    data.extend(uid.to_bytes(4, 'big'))
+    data.extend(timestamp.to_bytes(4, 'big'))
+    return base64.b64encode(bytes(data)).decode()
 
 
 class BiliTicketAPI:
@@ -682,6 +699,9 @@ class BiliTicketAPI:
 
         if ptoken:
             payload["ptoken"] = ptoken
+        elif ctoken:
+            uid = int(self.config.get("auth", {}).get("uid", 0))
+            payload["ptoken"] = generate_ptoken(ctoken, uid, int(time.time()))
         if captcha_voucher:
             payload["voucher"] = captcha_voucher
 
@@ -794,7 +814,7 @@ class BiliTicketAPI:
                     order_type: int = 1,
                     wait_sale: bool = False, sale_time_str: str = "",
                     poll_interval: float = None,
-                    max_retry_seconds: float = 10.0) -> Optional[dict]:
+                    max_retry_per_token: int = 60) -> Optional[dict]:
         """抢票引擎
 
         dry_run: True=仅打印 payload, False=prepare → createV2 真实下单
@@ -844,11 +864,10 @@ class BiliTicketAPI:
         _token = token
         _ptoken = ""
         _voucher = ""
-        deadline = time.monotonic() + max_retry_seconds
-        slow_count = 0
-        count_412 = 0
+        attempt = 0
+        round_num = 0
 
-        while time.monotonic() < deadline:
+        while True:
             attempt += 1
             try:
                 if not _token:
@@ -865,14 +884,9 @@ class BiliTicketAPI:
                         _ptoken = prep_data.get("ptoken", "")
                         print(f"[prepare OK] token={_token[:20]}..."
                               f"{' ptoken=' + _ptoken[:10] + '...' if _ptoken else ''}")
-                    elif prep_code == 412:
-                        count_412 += 1
-                        backoff = 1 if count_412 < 20 else 300
-                        print(f"[prepare 412 #{attempt}] 访问拒绝, "
-                              f"退避 {backoff}s (第{count_412}次)")
-                        if count_412 >= 20:
-                            print(f"[prepare] 连续 20 次 412, 冷却 5 分钟")
-                        time.sleep(backoff)
+                    elif prep_errno == 412 or prep_errno == 429:
+                        print(f"[prepare {prep_errno}] 重试 {poll_interval}s")
+                        time.sleep(poll_interval)
                         continue
                     else:
                         print(f"[prepare fail #{attempt}] "
@@ -910,98 +924,70 @@ class BiliTicketAPI:
                     self._notify_success(order, buyer_name)
                     return {"order_id": order_id, **order_data}
 
-                if reason == "RATE_LIMIT":
-                    slow_count += 1
-                    backoff = min(0.5 * (2 ** (slow_count - 1)), 2.0)
-                    print(f"[限流 #{attempt}] → 退避 {backoff}s")
-                    if slow_count >= 5:
-                        print("[停止] 连续 5 次限流")
-                        return None
-                    time.sleep(backoff)
+                if reason == "RATE_LIMIT" or code in (412, 429) or errno in (412, 429):
+                    print(f"[#{attempt}] code={code or errno} {msg[:40]}")
+                    time.sleep(poll_interval)
                     continue
 
                 if reason == "NOT_STARTED":
-                    print(f"[未开售 #{attempt}] {msg} → 重新获取 token")
-                    _token = ""
-                    _ptoken = ""
-                    time.sleep(poll_interval)
-                    continue
+                    print(f"[#{attempt}] {msg} → 重新prepare")
+                    break
 
                 if reason == "NEED_CONTACT":
-                    print(f"[错误 #{attempt}] {msg} → 需要填写手机号")
-                    print(f"  当前 buyer_phone='{buyer_phone}'")
+                    print(f"[#{attempt}] {msg}")
                     return None
-                    print(f"[售罄 #{attempt}] {msg}")
+
+                if reason == "SOLD_OUT":
+                    print(f"[#{attempt}] {msg}")
                     return None
 
                 if reason == "AUTH_ERROR":
-                    print(f"[鉴权 #{attempt}] {msg}")
+                    print(f"[#{attempt}] {msg}")
                     return None
 
-                if reason == "CAPTCHA":
-                    print(f"[风控 #{attempt}] code={code} {msg}")
-                    if code == 100044:
-                        _voucher = self.solve_captcha(project_id, screen_id)
-                        if _voucher:
-                            print(f"[验证码] 已解决, 重试...")
-                            continue
+                if reason == "CAPTCHA" or code == 100044 or errno == 100044:
+                    _voucher = self.solve_captcha(project_id, screen_id)
+                    if _voucher:
+                        print(f"[验证码] 已解决, 重试...")
+                        continue
                     return None
 
-                if code == 412:
-                    count_412 += 1
-                    backoff = 1 if count_412 < 20 else 300
-                    print(f"[412 #{attempt}] 访问拒绝, "
-                          f"退避 {backoff}s ({count_412}/20)")
-                    if count_412 >= 20:
-                        print("[412] 连续 20 次, 冷却 5 分钟")
-                    time.sleep(backoff)
-                    _token = ""
-                    _ptoken = ""
-                    continue
+                if code == 100051 or errno == 100051:
+                    print(f"[#{attempt}] token过期 → 重新prepare")
+                    break
 
-                if code == 100001 or code == 100009:
-                    print(f"[重试 #{attempt}] code={code} {msg}")
-                    _token = ""
-                    _ptoken = ""
-                    time.sleep(poll_interval)
-                    continue
-
-                if code == 100034:
+                if code == 100034 or errno == 100034:
                     new_price = order.get("data", {}).get("pay_money", pay_money)
-                    print(f"[价格变动 #{attempt}] 新价格: {new_price} (旧: {pay_money})")
-                    pay_money = new_price
-                    _token = ""
-                    _ptoken = ""
-                    continue
+                    if new_price and new_price != pay_money:
+                        print(f"[#{attempt}] 票价 {pay_money}→{new_price}")
+                        pay_money = new_price
+                    break
 
-                if code == 3:
-                    print(f"[屏蔽 #{attempt}] {msg} → 退避 5s")
-                    time.sleep(5)
-                    _token = ""
-                    _ptoken = ""
-                    continue
+                if code in (100001, 100009) or errno in (100001, 100009):
+                    print(f"[#{attempt}] code={code or errno} {msg[:40]} → 重新prepare")
+                    break
 
-                if code == -401:
-                    print(f"[GAIA #{attempt}] 触发反机器人验证, 需手动处理")
+                if code == -401 or errno == -401:
+                    print(f"[GAIA] 触发反机器人验证")
                     return None
 
-                print(f"[错误 #{attempt}] code={code} {msg}")
-                slow_count = 0
-                count_412 = 0
+                # 412/429/900001/3 等全部不退避, 固定间隔死磕
+                print(f"[#{attempt}] code={code or errno} {msg[:40]}")
                 time.sleep(poll_interval)
 
             except requests.Timeout:
-                print(f"[超时 #{attempt}] 重试...")
+                print(f"[超时 #{attempt}]")
                 time.sleep(poll_interval)
             except requests.ConnectionError:
-                print(f"[网络 #{attempt}] 重试...")
+                print(f"[网络 #{attempt}]")
                 time.sleep(1)
             except KeyboardInterrupt:
                 print("\n[中断]")
                 return None
 
-        print(f"[停止] 超时 {max_retry_seconds}s")
-        return None
+            # token 耗尽 → 重新 prepare
+            _token = ""
+            _ptoken = ""
 
     @staticmethod
     def _wait_until_sale(target_time: datetime) -> None:
