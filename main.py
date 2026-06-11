@@ -920,6 +920,9 @@ def interactive_menu():
         val = input(f"  {msg}" + (f" [{default}]" if default else "") + ": ").strip()
         return val if val else default
 
+    def _clear():
+        os.system("clear" if os.name == "posix" else "cls")
+
     def _ensure_api():
         nonlocal api, logged_in, login_name
         if not api or not api.is_authenticated():
@@ -954,6 +957,7 @@ def interactive_menu():
         print(f"{'─' * 60}")
 
         choice = _prompt("选择").strip().upper()
+        _clear()
 
         try:
             if choice == "1":
@@ -1173,7 +1177,6 @@ def interactive_menu():
                 pid = int(_prompt("项目ID", str(last_project or 1001227)) or "1001227")
                 print(f"\n  启动逆向工程 (python reverse.py {pid} --quick)...\n")
                 subprocess.run([sys.executable, "reverse.py", str(pid), "--quick"])
-                input("\n  按回车返回...")
 
             elif choice in ("A", "a"):
                 while True:
@@ -1230,6 +1233,9 @@ def interactive_menu():
         except Exception as e:
             print(f"  错误: {e}")
             continue
+        finally:
+            if choice != "0":
+                input("\n  按回车返回菜单...")
 
 
 if __name__ == "__main__":
