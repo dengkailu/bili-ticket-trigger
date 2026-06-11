@@ -938,6 +938,7 @@ def interactive_menu():
         return True
 
     while True:
+        _clear()
         print(f"\n{' B站会员购抢票工具 ':━^60}")
         print(f"  登录: {'✓ ' + (login_name if logged_in else '') if logged_in else '✗ 未登录'}")
         print(f"  购票人: {len(load_buyers())} 人")
