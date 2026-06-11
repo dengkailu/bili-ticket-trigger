@@ -143,49 +143,69 @@ def validate_buyer(name: str, id_card: str, phone: str = "",
     return len(errors) == 0, errors
 
 
-def generate_ctoken(touchend=0, scrollX=0, scrollY=0,
-                     visibilitychange=0, openWindow=0,
-                     innerWidth=362, innerHeight=795,
-                     outerWidth=0, outerHeight=0,
-                     screenX=0, screenY=0,
-                     screenWidth=362, screenHeight=795,
-                     timer=0, ticket_collection_t=None):
-    """生成 ctoken 浏览器指纹"""
-    data = bytearray(b'\x00')
-    for v in [touchend, scrollX, scrollY,
-              visibilitychange, openWindow,
-              innerWidth, innerHeight,
-              outerWidth, outerHeight,
-              screenX, screenY,
-              screenWidth, screenHeight,
-              timer,
-              ticket_collection_t or int(time.time() * 1000)]:
-        if v is not None and v > 255:
-            data.extend(b'\xff\x00')
-        else:
-            data.append((v or 0) & 0xff)
-    return base64.b64encode(data).decode()
+def generate_ctoken(ticket_collection_t=None, stay_time=0,
+                     is_create_v2=False, time_offset=0):
+    """生成 ctoken 浏览器指纹 (16字节定长, 参考 biliTickerBuy)
 
+    格式: 16字节 buffer → to_binary 二次编码 (byte→uint16→uint8)
+    参数来源于手机端抓包。
 
-def generate_ptoken(ctoken_str: str, uid: int, timestamp: int) -> str:
+    is_create_v2=False: prepare 阶段 (touch随机, timer=stay)
+    is_create_v2=True:  createV2 阶段 (page_unload=25, timer=delta+stay)
     """
-    生成 ptoken (热门项目必需, BW等)
+    tc = ticket_collection_t or time.time()
 
-    算法推断 (来自 BHYG generate_ptoken 结构):
-      ptoken = base64( \x00 + ctoken_bytes + uid(4) + ts(4) )
+    buf = bytearray(16)
 
-    逻辑: ptoken 是"带用户身份的 ctoken",
-          服务端用它关联浏览器指纹和用户账号,
-          防止指纹复用。
+    if is_create_v2:
+        time_diff = int(time.time() + time_offset - tc)
+        timer_val = int(time_diff + stay_time)
+        buf[0] = 255 & 0xFF           # touch_event
+        buf[2] = 2 & 0xFF             # visibility_change
+        buf[4] = 255 & 0xFF           # inner_width
+        buf[5] = 25 & 0xFF            # page_unload
+        buf[6] = 255 & 0xFF           # inner_height
+        buf[7] = 255 & 0xFF           # outer_width
+        buf[8] = (timer_val >> 8) & 0xFF
+        buf[9] = timer_val & 0xFF
+        buf[10] = (time_diff >> 8) & 0xFF
+        buf[11] = time_diff & 0xFF
+        buf[12] = 255 & 0xFF          # outer_height
+        buf[13] = 0 & 0xFF            # screen_x
+        buf[14] = 0 & 0xFF            # screen_y
+        buf[15] = 255 & 0xFF          # screen_width
+    else:
+        import random
+        timer_val = int(stay_time)
+        r = random.randint(1000, 3000)
+        buf[0] = random.randint(3, 10) & 0xFF  # touch_event (随机)
+        buf[2] = 2 & 0xFF
+        buf[4] = 255 & 0xFF
+        buf[6] = 255 & 0xFF
+        buf[7] = 255 & 0xFF
+        buf[8] = (timer_val >> 8) & 0xFF
+        buf[9] = timer_val & 0xFF
+        buf[12] = 255 & 0xFF
+        buf[15] = 255 & 0xFF
+        # 条件值: scroll_y 或 screen_avail_width
+        condition = r & 4  # screen_height 模拟
+        buf[1] = (r if condition else random.randint(1, 100)) & 0xFF
+        buf[3] = (r if condition else random.randint(1, 100)) & 0xFF
 
-    ⚠️ 待 BW2026 开售后验证, 当前为推断实现
+    return _to_binary(buf)
+
+
+def _to_binary(data: bytearray) -> str:
+    """二次编码: byte → uint16 → uint8 (参考 biliTickerBuy CTokenGenerator.to_binary)
+
+    每个原始字节扩展为2字节: [val & 0xFF, (val >> 8) & 0xFF]
+    效果: 16字节输入 → 32字节 → base64
     """
-    ctoken_bytes = base64.b64decode(ctoken_str)
-    data = bytearray(b'\x00')
-    data.extend(ctoken_bytes)
-    data.extend(uid.to_bytes(4, 'big'))
-    data.extend(timestamp.to_bytes(4, 'big'))
-    return base64.b64encode(bytes(data)).decode()
+    result = bytearray()
+    for b in data:
+        result.append(b & 0xFF)
+        result.append(0)  # upper byte always 0 (input bytes < 256)
+    return base64.b64encode(bytes(result)).decode()
 
 
 class BiliTicketAPI:
@@ -652,7 +672,9 @@ class BiliTicketAPI:
         if not device_id:
             device_id = self._extract_device_id()
         if not ctoken:
-            ctoken = generate_ctoken()
+            ctoken = generate_ctoken(ticket_collection_t=time.time(),
+                                      stay_time=random.randint(2000, 10000),
+                                      is_create_v2=True)
 
         payload = {
             "project_id": project_id,
@@ -699,9 +721,6 @@ class BiliTicketAPI:
 
         if ptoken:
             payload["ptoken"] = ptoken
-        elif ctoken:
-            uid = int(self.config.get("auth", {}).get("uid", 0))
-            payload["ptoken"] = generate_ptoken(ctoken, uid, int(time.time()))
         if captcha_voucher:
             payload["voucher"] = captcha_voucher
 
@@ -732,11 +751,9 @@ class BiliTicketAPI:
         if not device_id:
             device_id = self._extract_device_id()
 
-        ctoken = generate_ctoken(
-            touchend=random.randint(1, 5),
-            visibilitychange=random.randint(1, 3),
-            openWindow=random.randint(1, 3),
-        )
+        ctoken = generate_ctoken(ticket_collection_t=time.time(),
+                                  stay_time=random.randint(2000, 10000),
+                                  is_create_v2=False)
 
         payload = {
             "project_id": project_id,
@@ -824,11 +841,9 @@ class BiliTicketAPI:
             poll_interval = load_config().get("poll_interval", 0.3)
         cfg = load_config()
         device_id = self._extract_device_id()
-        ctoken = generate_ctoken(
-            touchend=random.randint(1, 5),
-            visibilitychange=random.randint(1, 3),
-            openWindow=random.randint(1, 3),
-        )
+        ctoken = generate_ctoken(ticket_collection_t=time.time(),
+                                  stay_time=random.randint(2000, 10000),
+                                  is_create_v2=False)
 
         if dry_run:
             payload = {
