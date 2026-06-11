@@ -959,6 +959,7 @@ def interactive_menu():
 
         choice = _prompt("选择").strip().upper()
         _clear()
+        need_pause = True
 
         try:
             if choice == "1":
@@ -1011,6 +1012,7 @@ def interactive_menu():
                             except ValueError:
                                 pass
                     elif sub == "0":
+                        need_pause = False
                         break
 
             elif choice == "4":
@@ -1222,10 +1224,12 @@ def interactive_menu():
                         save_config(cfg)
                         print(f"  通知: {'启用' if cfg['notification']['enabled'] else '禁用'}")
                     elif sub == "0":
+                        need_pause = False
                         break
 
             elif choice == "0":
                 print("  再见!")
+                need_pause = False
                 break
 
         except KeyboardInterrupt:
@@ -1235,7 +1239,7 @@ def interactive_menu():
             print(f"  错误: {e}")
             continue
         finally:
-            if choice != "0":
+            if need_pause and choice != "0":
                 input("\n  按回车返回菜单...")
 
 
