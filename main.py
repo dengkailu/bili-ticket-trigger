@@ -903,7 +903,7 @@ def interactive_menu():
 
     cfg = load_config()
     api = None
-    last_project = None
+    last_project = cfg.get("last_project")
     last_avail = None
 
     logged_in = bool(cfg.get("cookie"))
@@ -1105,6 +1105,8 @@ def interactive_menu():
                 try:
                     pid = int(pid)
                     last_project = pid
+                    cfg["last_project"] = pid
+                    save_config(cfg)
                 except ValueError:
                     print("  无效的项目ID")
                     continue
@@ -1469,6 +1471,9 @@ def interactive_menu():
             print(f"  错误: {e}")
             continue
         finally:
+            if last_project and cfg.get("last_project") != last_project:
+                cfg["last_project"] = last_project
+                save_config(cfg)
             if need_pause and choice != "0":
                 input("\n  按回车返回菜单...")
 

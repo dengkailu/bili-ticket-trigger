@@ -11,6 +11,7 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 DEFAULT_CONFIG = {
     "cookie": "",
     "version": "134",
+    "last_project": None,
     "base_url": "https://show.bilibili.com",
     "request_timeout": 10,
     "poll_interval": 0.5,
