@@ -903,6 +903,14 @@ class BiliTicketAPI:
         if avail:
             self._last_ticket_desc = avail[0].get("desc", "")
 
+        # 定时等待 (dry-run 和 real 都等)
+        if wait_sale and sale_time_str:
+            try:
+                st = datetime.fromisoformat(sale_time_str.replace(" ", "T"))
+                self._wait_until_sale(st)
+            except Exception as e:
+                print(f"[警告] 开售时间解析失败: {e}")
+
         if dry_run:
             payload = {
                 "project_id": project_id, "screen_id": screen_id,
@@ -931,14 +939,6 @@ class BiliTicketAPI:
                 print(f"  (token 为空时将自动调用 prepare 获取)")
             return {"dry_run": True, "payload": payload}
 
-        if wait_sale and sale_time_str:
-            try:
-                st = datetime.fromisoformat(sale_time_str.replace(" ", "T"))
-                self._wait_until_sale(st)
-            except Exception as e:
-                print(f"[警告] 开售时间解析失败: {e}")
-
-        attempt = 0
         _token = token
         _ptoken = ""
         _voucher = ""
