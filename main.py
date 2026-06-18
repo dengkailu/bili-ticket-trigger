@@ -43,6 +43,12 @@ from bili_api import (
     validate_id_card,
     validate_phone,
 )
+
+# ANSI 颜色
+_C = {"R": "\033[91m", "G": "\033[92m", "Y": "\033[93m",
+       "B": "\033[94m", "M": "\033[95m", "C": "\033[96m",
+       "W": "\033[97m", "D": "\033[90m", "X": "\033[0m"}
+def _c(color, text): return f"{_C.get(color,'')}{text}{_C['X']}"
 from config import load_config, save_config, get_proxy
 
 
@@ -946,13 +952,6 @@ def interactive_menu():
 
     def _clear():
         os.system("clear" if os.name == "posix" else "cls")
-
-    _C = {  # ANSI 色码
-        "R": "\033[91m", "G": "\033[92m", "Y": "\033[93m",
-        "B": "\033[94m", "M": "\033[95m", "C": "\033[96m",
-        "W": "\033[97m", "D": "\033[90m", "X": "\033[0m",
-    }
-    def _c(color, text): return f"{_C.get(color,'')}{text}{_C['X']}"
 
     def _ensure_api():
         nonlocal api, logged_in, login_name
