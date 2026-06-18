@@ -764,6 +764,14 @@ class BiliTicketAPI:
 
         if ptoken:
             payload["ptoken"] = ptoken
+        elif ctoken:
+            uid = int(self.config.get("auth", {}).get("uid", 0))
+            cb = base64.b64decode(ctoken)
+            pt = bytearray(b'\x00')
+            pt.extend(cb)
+            pt.extend(uid.to_bytes(8, 'big'))          # UID 8字节 (兼容52位新UID)
+            pt.extend(int(time.time()).to_bytes(4, 'big'))
+            payload["ptoken"] = base64.b64encode(bytes(pt)).decode()
         if captcha_voucher:
             payload["voucher"] = captcha_voucher
 
