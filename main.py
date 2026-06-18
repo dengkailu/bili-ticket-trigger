@@ -462,48 +462,64 @@ def cmd_check(args):
 def cmd_monitor(args):
     api = BiliTicketAPI()
 
-    print(f"\n  监控模式: 仅监控 (不购买)")
-    print(f"  项目: {args.project_id}")
-    if args.sku_id:
-        print(f"  票档: {args.sku_id}")
-    else:
-        print(f"  票档: 所有可售票档")
-    if args.screen_id:
-        print(f"  场次: {args.screen_id}")
-    print(f"  间隔: {args.interval}s")
+    print(f"\n  监控模式: 实时票务")
+    print(f"  项目: {args.project_id}  间隔: {args.interval}s")
     print(f"  按 Ctrl+C 退出\n")
 
     count = 0
-    last_status = ""
+    prev_table = ""
     while True:
         count += 1
         try:
-            status, available = api.check_ticket_available(
-                args.project_id,
-                sku_id=args.sku_id or 0,
-                screen_id=args.screen_id or 0,
-                min_price=args.min_price,
-                max_price=args.max_price,
-            )
+            data = api.get_project_summary(args.project_id)
+            if not data:
+                print(f"  获取失败")
+                sleep(args.interval)
+                continue
 
-            ts = _time.strftime("%H:%M:%S")
-            proj_sf = PROJECT_SALE_FLAG_MAP.get(
-                status.get("sale_flag_number", -1), "未知")
-
-            if status.get("sale_flag_number") == 102:
-                print(f"[{ts} #{count}] 项目已结束 ({status.get('sale_flag')})")
+            p = data
+            proj_sf = PROJECT_SALE_FLAG_MAP.get(p.get("sale_flag_number", -1), "未知")
+            if p.get("sale_flag_number") == 102:
+                print(f"  项目已结束")
                 break
 
-            if available:
-                for t in available:
-                    sc_name = t["screen_name"][:20]
-                    print(f"[{ts} #{count}] 可购 | {sc_name} | {t['desc']} "
-                          f"¥{t['price_yuan']} 余{t['num']} | "
-                          f"发售:{t.get('sale_start', '?')[:10]}")
-                last_status = proj_sf
-            elif proj_sf != last_status or count % 30 == 0:
-                last_status = proj_sf
-                print(f"[{ts} #{count}] 无票 | 状态: {proj_sf}")
+            # 生成完整票档表格
+            screens = p.get("screen_list", [])
+            lines = []
+            lines.append(f"\n  [{_time.strftime('%H:%M:%S')} #{count}] 状态: {proj_sf}  |  "
+                          f"{p.get('name','')[:25]}")
+            lines.append(f"  {'SKU':>8}  {'场次':<16}  {'票档':<14}  {'单价':>6}  {'状态':<6}  {'余量'}")
+            lines.append(f"  {'┄'*60}")
+
+            all_same = True
+            for sc in screens:
+                for tk in sc.get("ticket_list", []):
+                    sfn = tk.get("sale_flag_number", 0)
+                    flag = SALE_FLAG_MAP.get(sfn, "未知")
+                    sn = sc["name"]
+                    if len(sn) > 14: sn = sn[:12] + ".."
+                    desc = tk["desc"]
+                    if len(desc) > 11: desc = desc[:10] + ".."
+                    clr = "G" if sfn == 2 else "D" if sfn == 1 else ""
+                    if sfn == 2: all_same = False
+                    if clr:
+                        lines.append(f"  {tk['id']:>8}  {sn:<16}  {desc:<14}  "
+                                      f"¥{tk['price']/100:>5.0f}  "
+                                      f"{_c(clr, flag):<10}  {tk.get('num', 0):>4}")
+                    else:
+                        lines.append(f"  {tk['id']:>8}  {sn:<16}  {desc:<14}  "
+                                      f"¥{tk['price']/100:>5.0f}  "
+                                      f"  {flag:<8}  {tk.get('num', 0):>4}")
+
+            table = "\n".join(lines)
+            if table != prev_table or count % 20 == 0:
+                print(table)
+                prev_table = table
+
+            if all_same and count % 20 != 0:
+                sleep(args.interval)
+                continue
+
             sleep(args.interval)
         except KeyboardInterrupt:
             print("\n[退出]")
