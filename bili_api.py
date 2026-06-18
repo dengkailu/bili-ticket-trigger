@@ -39,8 +39,10 @@ from config import load_config, save_config, ProxyRotator
 BUYERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buyers.json")
 
 SALE_FLAG_MAP = {
+    1: "未开售",
     2: "预售中",
     3: "已停售",
+    4: "已售罄",
     5: "不可售",
     102: "已结束",
 }
