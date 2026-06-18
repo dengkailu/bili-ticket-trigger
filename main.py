@@ -1136,22 +1136,29 @@ def interactive_menu():
                     for tk in sc.get("ticket_list", []):
                         sfn = tk.get("sale_flag_number", 0)
                         flag = SALE_FLAG_MAP.get(sfn, "未知")
+                        sn = sc["name"]
+                        # 超长截断: 场次≤14字, 票档≤11字
+                        if len(sn) > 14:
+                            sn = sn[:12] + ".."
+                        desc = tk["desc"]
+                        if len(desc) > 11:
+                            desc = desc[:10] + ".."
                         all_tickets.append({
                             "sku_id": tk["id"],
-                            "screen_name": sc["name"][:20],
-                            "desc": tk["desc"],
+                            "screen_name": sn,
+                            "desc": desc,
                             "price": tk["price"] / 100,
                             "flag": flag,
                             "num": tk.get("num", 0),
                             "clickable": tk.get("clickable", False),
                         })
                 if all_tickets:
-                    print(f"\n  {'SKU':>8}  {'场次':<20}  {'票档':<18}  {'单价':>6}  {'状态':<8}  {'余量'}")
-                    print(f"  {'─'*70}")
+                    print(f"\n  {'SKU':>8}  {'场次':<16}  {'票档':<14}  {'单价':>6}  {'状态':<6}  {'余量'}")
+                    print(f"  {'┄'*60}")
                     for t in all_tickets:
                         clr = "G" if t["clickable"] else "D"
-                        print(f"  {t['sku_id']:>8}  {t['screen_name']:<20}  {t['desc']:<18}  "
-                              f"¥{t['price']:>5.0f}  {_c(clr, t['flag']):<12}  {t['num']:>4}")
+                        print(f"  {t['sku_id']:>8}  {t['screen_name']:<16}  {t['desc']:<14}  "
+                              f"¥{t['price']:>5.0f}  {_c(clr, t['flag']):<10}  {t['num']:>4}")
                 else:
                     print(f"\n  {_c('D','(暂无票档)')}")
                 print(f"  {_c('D', '(输入 [6] 开始抢票)')}")

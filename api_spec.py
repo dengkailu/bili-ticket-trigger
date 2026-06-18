@@ -700,7 +700,7 @@ for i, spec in enumerate(specs, 1):
     for p in spec["params"]:
         req = "必需" if p["required"] else "可选"
         print(f"    {p['name']:25s} {p['type']:20s} {req}")
-        print(f"      {p['desc']}")
+        print(f"      {p.get('desc', '')}")
 
     if "headers" in spec:
         print(f"\n  请求头:")
