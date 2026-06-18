@@ -474,6 +474,7 @@ def cmd_monitor(args):
     print(f"  按 Ctrl+C 退出\n")
 
     count = 0
+    last_status = ""
     while True:
         count += 1
         try:
@@ -499,7 +500,9 @@ def cmd_monitor(args):
                     print(f"[{ts} #{count}] 可购 | {sc_name} | {t['desc']} "
                           f"¥{t['price_yuan']} 余{t['num']} | "
                           f"发售:{t.get('sale_start', '?')[:10]}")
-            else:
+                last_status = proj_sf
+            elif proj_sf != last_status or count % 30 == 0:
+                last_status = proj_sf
                 print(f"[{ts} #{count}] 无票 | 状态: {proj_sf}")
             sleep(args.interval)
         except KeyboardInterrupt:
