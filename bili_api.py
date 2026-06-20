@@ -387,7 +387,7 @@ class BiliTicketAPI:
                 time.sleep(1)
             except json.JSONDecodeError:
                 if attempt == self.max_retries - 1:
-                    raise
+                    return {"errno": -1, "msg": f"JSON解析失败 HTTP {resp.status_code}"}
                 time.sleep(0.5)
         return {}
 
