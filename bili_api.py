@@ -504,8 +504,7 @@ class BiliTicketAPI:
 
     def get_project_summary(self, project_id: int) -> Optional[dict]:
         detail = self.get_project_detail(project_id)
-        if detail.get("code") != 0:
-            print(f"[错误] 获取项目详情失败: {detail.get('message', detail)}")
+        if detail.get("code") != 0 and detail.get("errno") not in (0, None):
             return None
         return detail.get("data", {})
 
