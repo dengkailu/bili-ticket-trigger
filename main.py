@@ -978,7 +978,7 @@ def interactive_menu():
             from config import ProxyRotator
             pr = ProxyRotator(cfg)
             label = pr.current_url()
-            print(f"  代理: {_c('G', label)} (仅下单使用)")
+            print(f"  代理: {_c('G', label)}")
         notify = cfg.get("notification", {})
         if notify.get("enabled"):
             ch = "/".join([c for c in ["TG", "飞书"] if notify.get({"TG":"tg_token","飞书":"feishu_webhook"}[c])])

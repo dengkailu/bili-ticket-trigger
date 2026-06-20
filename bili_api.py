@@ -363,9 +363,10 @@ class BiliTicketAPI:
     def _request(self, method: str, path: str, **kwargs) -> dict:
         url = f"{self.base_url}{path}"
         kwargs.setdefault("timeout", self.timeout)
-        # 仅下单接口使用代理 (避免非下单请求浪费代理池)
-        if "order/" in path or "createV2" in path:
-            self._update_app_sign()
+        # 所有请求走代理
+        if self._proxy_rotator.active:
+            if "order/" in path or "createV2" in path:
+                self._update_app_sign()
             proxy = self._proxy_rotator.next()
             if proxy:
                 kwargs["proxies"] = proxy
