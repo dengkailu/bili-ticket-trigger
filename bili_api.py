@@ -499,11 +499,20 @@ class BiliTicketAPI:
     # ── 项目查询 ─────────────────────────────────────────────
 
     def get_project_detail(self, project_id: int) -> dict:
-        return self._request("GET",
-            f"/api/ticket/project/getV2?version={self.version}&id={project_id}")
+        for _ in range(5):
+            r = self._request("GET",
+                f"/api/ticket/project/getV2?version={self.version}&id={project_id}")
+            if r.get("errno") != -1:
+                return r
+            time.sleep(3)
+        return r
 
     def get_project_summary(self, project_id: int) -> Optional[dict]:
-        detail = self.get_project_detail(project_id)
+        for _ in range(5):
+            detail = self.get_project_detail(project_id)
+            if detail.get("errno") != -1:
+                break
+            time.sleep(3)
         if detail.get("code") != 0 and detail.get("errno") not in (0, None):
             return None
         return detail.get("data", {})
