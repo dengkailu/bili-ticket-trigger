@@ -1301,7 +1301,7 @@ def interactive_menu():
                     buyer_phone = b.get("phone", "")
                     buyer_id_card = b.get("id_card", "")
 
-                real = _prompt("真实下单? (y=下单, 其他=dry-run)", "n").lower() in ("y", "yes")
+                real = _prompt("真实下单? (回车确认, 输入n=dry-run)", "y").lower() not in ("n", "no")
                 sale_time = _prompt("开售时间 (如2026-06-10 18:00, 空=立即)", "")
                 max_retry = int(_prompt("每token重试次数", "60") or "60")
                 poll_interval = float(_prompt("重试间隔(秒)", "1.5") or "1.5")

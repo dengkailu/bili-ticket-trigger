@@ -696,7 +696,8 @@ class BiliTicketAPI:
                          ptoken: str = "", id_bind: int = 0,
                          order_type: int = 1,
                          ctoken: str = "",
-                         captcha_voucher: str = "") -> dict:
+                         captcha_voucher: str = "",
+                         with_ptoken: bool = True) -> dict:
         """createV2 下单 (完整版, 参考 BHYG)
 
         token/ptoken: 从 prepare 接口获取
@@ -764,14 +765,6 @@ class BiliTicketAPI:
 
         if ptoken:
             payload["ptoken"] = ptoken
-        elif ctoken:
-            uid = int(self.config.get("auth", {}).get("uid", 0))
-            cb = base64.b64decode(ctoken)
-            pt = bytearray(b'\x00')
-            pt.extend(cb)
-            pt.extend(uid.to_bytes(8, 'big'))          # UID 8字节 (兼容52位新UID)
-            pt.extend(int(time.time()).to_bytes(4, 'big'))
-            payload["ptoken"] = base64.b64encode(bytes(pt)).decode()
         if captcha_voucher:
             payload["voucher"] = captcha_voucher
 
@@ -881,6 +874,7 @@ class BiliTicketAPI:
                     pay_money: int = 0, dry_run: bool = True,
                     token: str = "", id_bind: int = 0,
                     order_type: int = 1,
+                    with_ptoken: bool = True,
                     wait_sale: bool = False, sale_time_str: str = "",
                     poll_interval: float = None,
                     max_retry_per_token: int = 60) -> Optional[dict]:
