@@ -372,6 +372,9 @@ class BiliTicketAPI:
         for attempt in range(self.max_retries):
             try:
                 resp = self.session.request(method, url, **kwargs)
+                ct = resp.headers.get("content-type", "")
+                if "json" not in ct:
+                    return {"errno": -1, "msg": f"非JSON响应 HTTP {resp.status_code}"}
                 data = resp.json()
                 return data
             except requests.Timeout:
